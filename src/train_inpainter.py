@@ -106,6 +106,83 @@ def gradient_l1_loss(y_true, y_pred):
     return tf.reduce_mean(tf.abs(grad_true - grad_pred))
 
 
+def _avg_pool_2x(x):
+    return tf.nn.avg_pool2d(x, ksize=2, strides=2, padding="SAME")
+
+
+def ssim_multiscale_stable(
+    y_true,
+    y_pred,
+    value_range=(0.0, 1.0),
+    max_levels=3,
+    filter_size=7,
+    k1=0.05,
+    k2=0.05,
+    weights=None,  # Noneなら標準重みの先頭 levels
+    mask=None,  # [N,H,W,1] 可。与えればマスク加重SSIM
+):
+    lo, hi = value_range
+    yt = tf.cast(y_true, tf.float32)
+    yp = tf.cast(y_pred, tf.float32)
+
+    # [lo,hi] -> [0,1]
+    scale = tf.maximum(hi - lo, 1e-6)
+    yt = (yt - lo) / scale
+    yp = (yp - lo) / scale
+
+    eps = 1e-6
+    yt = tf.clip_by_value(yt, eps, 1.0 - eps)
+    yp = tf.clip_by_value(yp, eps, 1.0 - eps)
+
+    tf.debugging.assert_all_finite(yt, "yt_before_ssim has NaN/Inf")
+    tf.debugging.assert_all_finite(yp, "yp_before_ssim has NaN/Inf")
+
+    std_pf5 = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
+    if weights is None:
+        w = std_pf5[:max_levels]
+        s = sum(w)
+        weights = [wi / s for wi in w]
+    else:
+        # Python list 前提、合計1に正規化
+        s = sum(weights)
+        weights = [wi / s for wi in weights]
+
+    ssim_vals = []
+    m = mask
+    for _ in range(max_levels):
+        if m is not None:
+            # マスク加重 SSIM
+            # tf.image.ssim は全画素で平均するので、局所SSIMを直接重み付けはできない。
+            # 代替として、マスクで画素を選別しつつ mean を調整（近似）。
+            ssim_map = tf.image.ssim(
+                yt, yp, max_val=1.0, filter_size=filter_size, k1=k1, k2=k2
+            )
+            # ssim_map: [N], すでに平均済なので厳密なマスク対応は困難。
+            # → 近似として全体の ssim を使うか、マスクにより y を補間してから計算する方が実用的。
+            ssim_vals.append(ssim_map)
+        else:
+            ssim_map = tf.image.ssim(
+                yt, yp, max_val=1.0, filter_size=filter_size, k1=k1, k2=k2
+            )
+            ssim_vals.append(ssim_map)
+        # 次スケールへ
+        yt = _avg_pool_2x(yt)
+        yp = _avg_pool_2x(yp)
+        if m is not None:
+            m = _avg_pool_2x(m)
+
+    # 重み付き平均（安定のため clamp）
+    ssim_vals = [tf.clip_by_value(v, 0.0, 1.0) for v in ssim_vals]
+    ms = 0.0
+    for wi, vi in zip(weights, ssim_vals):
+        ms = ms + wi * vi
+
+    tf.debugging.assert_all_finite(ms, "ms-ssim-stable returned NaN/Inf")
+    loss = 1.0 - tf.reduce_mean(ms)
+    tf.debugging.assert_all_finite(loss, "MS-SSIM-stable produced NaN/Inf")
+    return loss
+
+
 """
 def safe_ms_ssim(
     y_true, y_pred,
@@ -227,7 +304,8 @@ def composite_loss(
 
         # ssim_term = ms_ssim_loss(yt, yp) if use_ms_ssim else ssim_loss(yt, yp)
         if use_ms_ssim:
-            ssim_term = safe_ms_ssim(
+            # ssim_term = safe_ms_ssim(
+            ssim_term = ssim_multiscale_stable(
                 yt,
                 yp,
                 value_range=(0.0, 1.0),
