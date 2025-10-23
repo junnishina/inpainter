@@ -539,13 +539,14 @@ class InpaintingDataset:
         mask = mask.astype(np.float32)[..., None]  # (H,W,1)
 
         # スケーリング（0-1正規化や sm の mean/std）を適用
+        x_raw01 = x.astype(np.float32) / 255.0
         y01 = y.astype(np.float32) / 255.0
         x_pp = self.preprocess_input(
             x.astype(np.float32)
         )  # sm.get_preprocessing(backbone) に渡す入力は「0〜255スケールの float（dtype=float32）」が正解
 
         # 返却: x_pp（モデル入力）, y01（教師）, mask（sample_weight 用）
-        return x_pp, y01, mask
+        return x_pp, y01, x_raw01, mask
 
     def generator(self):
         files = self.files[:]
@@ -556,9 +557,9 @@ class InpaintingDataset:
             first_err = None
             for p in files:
                 try:
-                    x_pp, y, x_raw01 = self._make_pair(p)
+                    x_pp, y, x_raw01, mask = self._make_pair(p)
                     produced += 1
-                    yield x_pp, y, x_raw01
+                    yield x_pp, y, x_raw01, mask
                 except Exception as e:
                     if first_err is None:
                         first_err = (p, repr(e))
@@ -741,7 +742,7 @@ def make_tf_dataset(
         return hole
 
     def gen():
-        for x_pp, y, x_raw01 in dataset.generator():
+        for x_pp, y, x_raw01, hole_mask in dataset.generator():
             # クリップ＆型統一（安全策）
             # x_pp = np.clip(x_pp, 0.0, 1.0).astype(np.float32) # backbone正規化後のclipは排除
             x_pp = x_pp.astype(np.float32)
@@ -780,14 +781,11 @@ def make_tf_dataset(
                     )
                 yield x_pp, y, sw3.astype(np.float32)
                 """
-                # dataset.generator() の第3戻り値は穴マスク (H,W,1) なのでそのまま使う
-                hole_mask = x_raw01.astype(np.float32)
-                hole_mask = np.clip(hole_mask, 0.0, 1.0)
-                sw = hole_mask * float(hole_weight) + (1.0 - hole_mask) * float(
-                    context_weight
-                )
+                # dataset.generator() の第4戻り値は穴マスク (H,W,1)
+                hm = np.clip(hole_mask.astype(np.float32), 0.0, 1.0)  # (H,W,1)
+                sw = hm * float(hole_weight) + (1.0 - hm) * float(context_weight)
                 sw3 = np.repeat(sw, 3, axis=-1).astype(np.float32)
-                sw3 += 1e-6
+                sw3 += 1e-6  # 数値安定化
                 yield x_pp, y, sw3
             else:
                 yield x_pp, y
