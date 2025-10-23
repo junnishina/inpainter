@@ -310,7 +310,7 @@ def composite_loss(
                 yp,
                 value_range=(0.0, 1.0),
                 max_levels=5,  # 必要に応じて 3〜4 に
-                filter_size=7,  # 7 を推奨（小パッチ安定）
+                filter_size=11,  # 7,  # 7 を推奨（小パッチ安定）
                 k1=0.02,
                 k2=0.04,
             )
@@ -928,6 +928,7 @@ def parse_args():
     parser.add_argument("--steps-per-epoch", type=int, default=0)  # 0→自動計算
     parser.add_argument("--val-steps", type=int, default=0)
     parser.add_argument("--aug-prob", type=float, default=0.9)
+    parser.add_argument("--hole_weight", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=42)
 
     # SageMaker input/output channels
@@ -1001,7 +1002,7 @@ def main():
         train_ds_builder,
         batch_size=args.batch_size,
         return_mask_weight=True,
-        hole_weight=3.0,
+        hole_weight=args.hole_weight,
         context_weight=1.0,
         mask_fill_value=0.0,
         mask_thr=1.0 / 255.0,
@@ -1022,7 +1023,7 @@ def main():
         val_ds_builder,
         batch_size=args.batch_size,
         return_mask_weight=False,  # もし検証でも重みを使いたいなら、context_weight>0 かつ eps 付与を必ず適用
-        hole_weight=3.0,
+        hole_weight=args.hole_weight,
         context_weight=1.0,
         mask_fill_value=0.0,
         mask_thr=1.0 / 255.0,
@@ -1132,7 +1133,7 @@ def main():
         ),
         tf.keras.callbacks.EarlyStopping(
             monitor="val_ssim_metric" if val_ds is not None else "psnr_metric",
-            patience=5,
+            patience=8,
             mode="max",
             restore_best_weights=True,
         ),
