@@ -1,0 +1,4 @@
+boto3
+segmentation_models
+tensorflow-addons
+albumentations
