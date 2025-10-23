@@ -1,4 +1,5 @@
 import os
+
 os.environ["SM_FRAMEWORK"] = "tf.keras"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
@@ -16,10 +17,10 @@ import albumentations as A
 import segmentation_models as sm
 
 # 画像データ形式は明示的に NHWC
-K.set_image_data_format('channels_last')
+K.set_image_data_format("channels_last")
 
 # Grappler のレイアウト最適化を無効化
-tf.config.optimizer.set_experimental_options({'layout_optimizer': False})
+tf.config.optimizer.set_experimental_options({"layout_optimizer": False})
 
 # XLA を使っている場合は無効化（保険）
 try:
@@ -27,15 +28,19 @@ try:
 except Exception:
     pass
 
-#mixed_precision.set_global_policy('mixed_float16') 
-mixed_precision.set_global_policy('float32')  # 既に 'mixed_float16' なら変更
+# mixed_precision.set_global_policy('mixed_float16')
+mixed_precision.set_global_policy("float32")  # 既に 'mixed_float16' なら変更
+
 
 def _to_uint8_rgb(img01: np.ndarray) -> np.ndarray:
     """[0,1]のRGB(float32) → uint8 RGB"""
     img = np.clip(img01 * 255.0, 0.0, 255.0).astype(np.uint8)
     return img
 
-def save_preview_batch(x_raw01_b, y_b, y_pred_b, out_dir: str, prefix: str = "val", max_items: int = 16):
+
+def save_preview_batch(
+    x_raw01_b, y_b, y_pred_b, out_dir: str, prefix: str = "val", max_items: int = 16
+):
     """
     x_raw01_b, y_b, y_pred_b: (B,H,W,3), [0,1] の想定
     [input | pred | target] を横連結して PNG 保存
@@ -43,15 +48,18 @@ def save_preview_batch(x_raw01_b, y_b, y_pred_b, out_dir: str, prefix: str = "va
     os.makedirs(out_dir, exist_ok=True)
     b = min(x_raw01_b.shape[0], max_items)
     for i in range(b):
-        in_img  = _to_uint8_rgb(x_raw01_b[i])
-        pr_img  = _to_uint8_rgb(y_pred_b[i])
-        gt_img  = _to_uint8_rgb(y_b[i])
+        in_img = _to_uint8_rgb(x_raw01_b[i])
+        pr_img = _to_uint8_rgb(y_pred_b[i])
+        gt_img = _to_uint8_rgb(y_b[i])
 
         concat = np.concatenate([in_img, pr_img, gt_img], axis=1)  # 横連結（W方向）
         # OpenCVはBGR期待なので変換して保存
-        cv2.imwrite(os.path.join(out_dir, f"{prefix}_{i:03d}.png"),
-                    cv2.cvtColor(concat, cv2.COLOR_RGB2BGR))
-        
+        cv2.imwrite(
+            os.path.join(out_dir, f"{prefix}_{i:03d}.png"),
+            cv2.cvtColor(concat, cv2.COLOR_RGB2BGR),
+        )
+
+
 def weights_arg(s: str):
     if s is None:
         return None
@@ -67,16 +75,19 @@ def weights_arg(s: str):
 
 EPS = 1e-7
 
+
 def _to_float01(y_true, y_pred):
     # AMP（mixed_precision）でもSSIM計算はfloat32で安定させる
     yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0.0, 1.0)
     yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0.0, 1.0)
     return yt, yp
 
+
 def ssim_loss(y_true, y_pred):
     yt, yp = _to_float01(y_true, y_pred)
     ssim = tf.image.ssim(yt, yp, max_val=1.0)
     return 1.0 - tf.reduce_mean(ssim)
+
 
 def ms_ssim_loss(y_true, y_pred):
     yt, yp = _to_float01(y_true, y_pred)
@@ -85,6 +96,7 @@ def ms_ssim_loss(y_true, y_pred):
     msssim = tf.where(tf.math.is_finite(msssim), msssim, tf.zeros_like(msssim))
     return 1.0 - tf.reduce_mean(msssim)
 
+
 def gradient_l1_loss(y_true, y_pred):
     yt, yp = _to_float01(y_true, y_pred)
     sobel_true = tf.image.sobel_edges(yt)
@@ -92,6 +104,7 @@ def gradient_l1_loss(y_true, y_pred):
     grad_true = tf.abs(sobel_true[..., 0]) + tf.abs(sobel_true[..., 1])
     grad_pred = tf.abs(sobel_pred[..., 0]) + tf.abs(sobel_pred[..., 1])
     return tf.reduce_mean(tf.abs(grad_true - grad_pred))
+
 
 """
 def safe_ms_ssim(
@@ -132,6 +145,7 @@ def safe_ms_ssim(
     return loss
 """
 
+
 def _infer_msssim_levels_from_static_shape(shape, filter_size=7, max_levels=5):
     # shape: TensorShape([N, H, W, C]) を想定
     h = shape[1]
@@ -144,17 +158,19 @@ def _infer_msssim_levels_from_static_shape(shape, filter_size=7, max_levels=5):
     # 条件: min_hw >= filter_size * 2^(levels-1)
     # 最大 levels を探索
     levels = 1
-    while levels < max_levels and (filter_size * (2 ** levels)) <= min_hw:
+    while levels < max_levels and (filter_size * (2**levels)) <= min_hw:
         levels += 1
     return max(1, min(levels, max_levels))
 
 
 def safe_ms_ssim(
-    y_true, y_pred,
-    value_range=(0.0, 1.0),    # 出力/教師が [0,1] のとき (0,1)
+    y_true,
+    y_pred,
+    value_range=(0.0, 1.0),  # 出力/教師が [0,1] のとき (0,1)
     max_levels=5,
     filter_size=7,
-    k1=0.02, k2=0.04
+    k1=0.02,
+    k2=0.04,
 ):
     # 1) スケール合わせ（[0,1]）とクリップ（MS-SSIM は物理スケール前提）
     lo, hi = value_range
@@ -168,18 +184,20 @@ def safe_ms_ssim(
     yp = tf.clip_by_value(yp, eps_margin, 1.0 - eps_margin)
 
     # 2) levels は静的形状から推定（動的は 3 にフォールバック）
-    levels = _infer_msssim_levels_from_static_shape(yt.shape, filter_size=filter_size, max_levels=max_levels)
+    levels = _infer_msssim_levels_from_static_shape(
+        yt.shape, filter_size=filter_size, max_levels=max_levels
+    )
 
     # 3) power_factors は Python リストで固定長に
     power_factors = [1.0 / levels] * levels
 
     def assert_finite(name, t):
         tf.debugging.assert_all_finite(t, f"{name} has NaN/Inf")
-    
+
     # safe_ms_ssim 内、ssim_multiscale を呼ぶ直前に:
     assert_finite("yt_before_ssim", yt)
     assert_finite("yp_before_ssim", yp)
-    
+
     # 4) MS-SSIM 計算
     """
     ms = tf.image.ssim_multiscale(
@@ -196,7 +214,8 @@ def safe_ms_ssim(
     loss = 1.0 - tf.reduce_mean(ssim)
     tf.debugging.assert_all_finite(loss, "MS-SSIM produced NaN/Inf")
     return loss
-    
+
+
 def composite_loss(
     ssim_loss_weight=0.16,
     use_ms_ssim=True,
@@ -205,54 +224,68 @@ def composite_loss(
     def _loss(y_true, y_pred):
         yt, yp = _to_float01(y_true, y_pred)
         mae = tf.reduce_mean(tf.abs(yt - yp))
-        
-        #ssim_term = ms_ssim_loss(yt, yp) if use_ms_ssim else ssim_loss(yt, yp)
+
+        # ssim_term = ms_ssim_loss(yt, yp) if use_ms_ssim else ssim_loss(yt, yp)
         if use_ms_ssim:
-            ssim_term = safe_ms_ssim(yt, yp,
-                         value_range=(0.0, 1.0),
-                         max_levels=5, # 必要に応じて 3〜4 に
-                        filter_size=7, # 7 を推奨（小パッチ安定）
-                        k1=0.02, k2=0.04)
+            ssim_term = safe_ms_ssim(
+                yt,
+                yp,
+                value_range=(0.0, 1.0),
+                max_levels=5,  # 必要に応じて 3〜4 に
+                filter_size=7,  # 7 を推奨（小パッチ安定）
+                k1=0.02,
+                k2=0.04,
+            )
         else:
             ssim = tf.image.ssim(
                 tf.clip_by_value(yt, 0.0, 1.0),
                 tf.clip_by_value(yp, 0.0, 1.0),
-                max_val=1.0, filter_size=7, k1=0.02, k2=0.04
+                max_val=1.0,
+                filter_size=7,
+                k1=0.02,
+                k2=0.04,
             )
             ssim_term = 1.0 - tf.reduce_mean(ssim)
-            
+
         grad_term = gradient_l1_loss(yt, yp) if grad_loss_weight > 0 else 0.0
-        
+
         total = mae + ssim_loss_weight * ssim_term + grad_loss_weight * grad_term
         # 最終的に非有限は抑止
-        #return tf.where(tf.math.is_finite(total), total, tf.zeros_like(total))
+        # return tf.where(tf.math.is_finite(total), total, tf.zeros_like(total))
         # [debug] ここで即チェック（fail-fast）
         tf.debugging.assert_all_finite(total, "Loss has NaN/Inf")
         return total
+
     return _loss
+
 
 # メトリクス
 def psnr_metric(y_true, y_pred):
-    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0., 1.)
-    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0., 1.)
+    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0.0, 1.0)
+    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0.0, 1.0)
     v = tf.image.psnr(yt, yp, max_val=1.0)
-    #v = tf.where(tf.math.is_nan(v), tf.zeros_like(v), v)
+    # v = tf.where(tf.math.is_nan(v), tf.zeros_like(v), v)
     v = tf.where(tf.math.is_inf(v), tf.fill(tf.shape(v), 99.0), v)
     return tf.reduce_mean(v)
 
+
 def ssim_metric(y_true, y_pred):
-    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0., 1.)
-    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0., 1.)
+    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0.0, 1.0)
+    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0.0, 1.0)
     v = tf.image.ssim(yt, yp, max_val=1.0)
-    #v = tf.where(tf.math.is_finite(v), v, tf.zeros_like(v))
+    # v = tf.where(tf.math.is_finite(v), v, tf.zeros_like(v))
     return tf.reduce_mean(v)
 
+
 def psnr_raw(y_true, y_pred):
-    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0., 1.)
-    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0., 1.)
+    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0.0, 1.0)
+    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0.0, 1.0)
     return tf.reduce_mean(tf.image.psnr(yt, yp, max_val=1.0))
-    
-def list_image_files(root_dir: str, exts=(".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")) -> List[str]:
+
+
+def list_image_files(
+    root_dir: str, exts=(".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+) -> List[str]:
     files = []
     for ext in exts:
         files.extend(glob.glob(os.path.join(root_dir, f"**/*{ext}"), recursive=True))
@@ -274,13 +307,15 @@ def read_rgb_image(path: str) -> np.ndarray:
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     # 連続化（Albumentationsは連続配列が安全）
     return np.ascontiguousarray(img)
-    
+
+
 class RectDropout(A.ImageOnlyTransform):
     """
     ランダムな矩形穴を num_holes 個あける簡易欠損。
     画像サイズ比で穴サイズを指定するので解像度に依らず安定。
     Albumentationsバージョン非依存
     """
+
     def __init__(
         self,
         num_holes=4,
@@ -305,29 +340,35 @@ class RectDropout(A.ImageOnlyTransform):
         out = img.copy()
         rng = np.random.default_rng()
         for _ in range(self.num_holes):
-            rh = rng.integers(max(1, int(h * self.min_h_ratio)),
-                              max(2, int(h * self.max_h_ratio) + 1))
-            rw = rng.integers(max(1, int(w * self.min_w_ratio)),
-                              max(2, int(w * self.max_w_ratio) + 1))
+            rh = rng.integers(
+                max(1, int(h * self.min_h_ratio)), max(2, int(h * self.max_h_ratio) + 1)
+            )
+            rw = rng.integers(
+                max(1, int(w * self.min_w_ratio)), max(2, int(w * self.max_w_ratio) + 1)
+            )
             y1 = rng.integers(0, max(1, h - rh + 1))
             x1 = rng.integers(0, max(1, w - rw + 1))
-            out[y1:y1 + rh, x1:x1 + rw] = self.fill_value
+            out[y1 : y1 + rh, x1 : x1 + rw] = self.fill_value
         return out
 
     def get_transform_init_args_names(self):
         return (
             "num_holes",
-            "min_h_ratio", "max_h_ratio",
-            "min_w_ratio", "max_w_ratio",
+            "min_h_ratio",
+            "max_h_ratio",
+            "min_w_ratio",
+            "max_w_ratio",
             "fill_value",
         )
-        
+
+
 class InpaintingDataset:
     """
     欠損復元用のデータセット:
       - 入力: CoarseDropout を適用した欠損画像（+共通の幾何Aug）
       - 教師: 欠損なし画像（同じ幾何Augのみ）
     """
+
     def __init__(
         self,
         files: List[str],
@@ -344,32 +385,36 @@ class InpaintingDataset:
         self.rng = random.Random(seed)
 
         # 共有の幾何・色調Aug（教師にも適用）
-        self.shared_aug = A.Compose([
-            A.HorizontalFlip(p=0.5),
-            #A.VerticalFlip(p=0.1),
-            A.Affine( # ShiftScaleRotate代替
-                scale=(0.9, 1.1),
-                translate_percent=(-0.05, 0.05),
-                rotate=(-10, 10),
-                shear=0,
-                interpolation=cv2.INTER_LINEAR,
-                #mode=cv2.BORDER_CONSTANT,  # 黒で埋める
-                #cval=(0, 0, 0),            # 黒（グレースケールなら 0）
-                fit_output=False,
-                p=0.5
-            ),
-            A.RandomBrightnessContrast(p=0.2),
-            A.ColorJitter(p=0.05),
-            A.Resize(height=self.h, width=self.w, interpolation=cv2.INTER_AREA),
-        ])
+        self.shared_aug = A.Compose(
+            [
+                A.HorizontalFlip(p=0.5),
+                # A.VerticalFlip(p=0.1),
+                A.Affine(  # ShiftScaleRotate代替
+                    scale=(0.9, 1.1),
+                    translate_percent=(-0.05, 0.05),
+                    rotate=(-10, 10),
+                    shear=0,
+                    interpolation=cv2.INTER_LINEAR,
+                    # mode=cv2.BORDER_CONSTANT,  # 黒で埋める
+                    # cval=(0, 0, 0),            # 黒（グレースケールなら 0）
+                    fit_output=False,
+                    p=0.5,
+                ),
+                A.RandomBrightnessContrast(p=0.2),
+                A.ColorJitter(p=0.05),
+                A.Resize(height=self.h, width=self.w, interpolation=cv2.INTER_AREA),
+            ]
+        )
 
         # 欠損（入力のみに適用）
         if coarse_dropout_params is None:
             coarse_dropout_params = dict(
                 num_holes=4,
-                min_h_ratio=0.05, max_h_ratio=0.20,
-                min_w_ratio=0.05, max_w_ratio=0.20,
-                fill_value=0,   # ← masked_mae の fill_value と合わせる
+                min_h_ratio=0.05,
+                max_h_ratio=0.20,
+                min_w_ratio=0.05,
+                max_w_ratio=0.20,
+                fill_value=0,  # ← masked_mae の fill_value と合わせる
                 p=1.0,
             )
         self.dropout_aug = RectDropout(**coarse_dropout_params)
@@ -383,7 +428,7 @@ class InpaintingDataset:
         # debug 欠損を一旦オフ
         self.dropout_aug = None
         """
-        
+
         # 入力の前処理（エンコーダに一致）
         self.preprocess_input = sm.get_preprocessing(backbone_name)
         self.aug_prob = aug_prob
@@ -399,14 +444,14 @@ class InpaintingDataset:
         return img
 
     def _make_pair(self, path):
-        x = read_rgb_image(path)               # uint8, HxWx3
-        y = x.copy()                           # 教師
+        x = read_rgb_image(path)  # uint8, HxWx3
+        y = x.copy()  # 教師
         # まずは shared_aug のみ（uint8のまま適用）
         if self.shared_aug is not None:
             aug = self.shared_aug(image=x, mask=None)
             x = aug["image"]
             y = aug["image"]  # 同期させたいなら image を共用（マスクなし構成ならOK）
-    
+
         # 欠損 RectDropout 適用
         if self.dropout_aug is not None:
             x = self.dropout_aug(image=x)["image"]
@@ -414,15 +459,16 @@ class InpaintingDataset:
         # ここで欠損マスクを作成（fill_value=0 前提。違う場合は一致判定を調整）
         mask = (x[..., 0] == 0) & (x[..., 1] == 0) & (x[..., 2] == 0)  # True=穴
         mask = mask.astype(np.float32)[..., None]  # (H,W,1)
-        
+
         # スケーリング（0-1正規化や sm の mean/std）を適用
         y01 = y.astype(np.float32) / 255.0
-        x_pp    = self.preprocess_input(x.astype(np.float32)) # sm.get_preprocessing(backbone) に渡す入力は「0〜255スケールの float（dtype=float32）」が正解
-        
+        x_pp = self.preprocess_input(
+            x.astype(np.float32)
+        )  # sm.get_preprocessing(backbone) に渡す入力は「0〜255スケールの float（dtype=float32）」が正解
+
         # 返却: x_pp（モデル入力）, y01（教師）, mask（sample_weight 用）
         return x_pp, y01, mask
 
-            
     def generator(self):
         files = self.files[:]
         while True:
@@ -444,6 +490,7 @@ class InpaintingDataset:
                 if first_err:
                     msg += f" First error at: {first_err[0]} ; err={first_err[1]}"
                 raise RuntimeError(msg)
+
 
 def create_lr_schedule(
     initial_lr: float,
@@ -482,7 +529,7 @@ def create_lr_schedule(
     else:
         raise ValueError(f"Unsupported lr_schedule: {schedule_type}")
 
-    
+
 def build_model(
     image_size=(256, 256),
     backbone_name="resnet34",
@@ -501,9 +548,9 @@ def build_model(
     )
     optimizer = tf.keras.optimizers.Adam(
         learning_rate=learning_rate,
-        epsilon=1e-4, # 1e-7 → 1e-4 に引き上げ（数値安定）
+        epsilon=1e-4,  # 1e-7 → 1e-4 に引き上げ（数値安定）
         clipnorm=1.0,
-    )# または clipvalue=1.0)
+    )  # または clipvalue=1.0)
 
     # debug
     """
@@ -538,9 +585,9 @@ def build_model(
         weighted_metrics=[psnr_metric, ssim_metric],
     )
     """
-    
+
     return model
-    
+
 
 def make_tf_dataset(
     dataset: InpaintingDataset,
@@ -563,7 +610,9 @@ def make_tf_dataset(
     - x_raw01 は [0,1] の float を想定（マスク判定のしきい値は mask_thr）
     """
     if return_raw and return_mask_weight:
-        raise ValueError("return_raw と return_mask_weight は同時に True にはできません。")
+        raise ValueError(
+            "return_raw と return_mask_weight は同時に True にはできません。"
+        )
 
     H, W, C = dataset.h, dataset.w, 3
 
@@ -572,13 +621,17 @@ def make_tf_dataset(
         output_signature = (
             tf.TensorSpec(shape=(H, W, C), dtype=tf.float32),  # x_pp
             tf.TensorSpec(shape=(H, W, C), dtype=tf.float32),  # y
-            tf.TensorSpec(shape=(H, W, C), dtype=tf.float32),  # x_raw01（可視化用, 3ch化）
+            tf.TensorSpec(
+                shape=(H, W, C), dtype=tf.float32
+            ),  # x_raw01（可視化用, 3ch化）
         )
     elif return_mask_weight:
         output_signature = (
             tf.TensorSpec(shape=(H, W, C), dtype=tf.float32),  # x_pp
             tf.TensorSpec(shape=(H, W, C), dtype=tf.float32),  # y
-            tf.TensorSpec(shape=(H, W, C), dtype=tf.float32),  # sample_weight（y と同形状に統一）
+            tf.TensorSpec(
+                shape=(H, W, C), dtype=tf.float32
+            ),  # sample_weight（y と同形状に統一）
         )
     else:
         output_signature = (
@@ -652,7 +705,9 @@ def make_tf_dataset(
                 # dataset.generator() の第3戻り値は穴マスク (H,W,1) なのでそのまま使う
                 hole_mask = x_raw01.astype(np.float32)
                 hole_mask = np.clip(hole_mask, 0.0, 1.0)
-                sw = hole_mask * float(hole_weight) + (1.0 - hole_mask) * float(context_weight)
+                sw = hole_mask * float(hole_weight) + (1.0 - hole_mask) * float(
+                    context_weight
+                )
                 sw3 = np.repeat(sw, 3, axis=-1).astype(np.float32)
                 sw3 += 1e-6
                 yield x_pp, y, sw3
@@ -663,8 +718,11 @@ def make_tf_dataset(
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
-    
-def masked_mae_np(y_true, y_pred, x_input_raw01, fill_value=0.0, thr=1/255.0, use_all_channels=True):
+
+
+def masked_mae_np(
+    y_true, y_pred, x_input_raw01, fill_value=0.0, thr=1 / 255.0, use_all_channels=True
+):
     """
     安定版 masked MAE（numpy）
     - y_true, y_pred, x_input_raw01: np.ndarray, shape (B,H,W,C), 値域 [0,1] 想定
@@ -712,9 +770,10 @@ def masked_mae_np(y_true, y_pred, x_input_raw01, fill_value=0.0, thr=1/255.0, us
 
     val = float(np.sum(per_pixel_l1 * hole) / num)
     return val
-    
+
+
 class MaskedMAELogger(tf.keras.callbacks.Callback):
-    def __init__(self, raw_ds, name="val", fill_value=0.0, thr=1/255.0):
+    def __init__(self, raw_ds, name="val", fill_value=0.0, thr=1 / 255.0):
         super().__init__()
         self.raw_iter = iter(raw_ds)
         self.name = name
@@ -727,9 +786,15 @@ class MaskedMAELogger(tf.keras.callbacks.Callback):
         except StopIteration:
             return
         y_pred_b = self.model.predict(x_pp_b, verbose=0)
-        val = masked_mae_np(y_b.numpy(), y_pred_b, x_raw01_b.numpy(),
-                            fill_value=self.fill_value, thr=self.thr)
+        val = masked_mae_np(
+            y_b.numpy(),
+            y_pred_b,
+            x_raw01_b.numpy(),
+            fill_value=self.fill_value,
+            thr=self.thr,
+        )
         print(f"[eval] epoch {epoch+1}: masked MAE ({self.name}, 1 batch) = {val:.5f}")
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -747,31 +812,73 @@ def parse_args():
     )
 
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lr_schedule", type=str, default="cosine",
-                        choices=["cosine", "cosine_restarts"],
-                        help="Learning rate schedule type")
-    parser.add_argument("--final_lr_fraction", type=float, default=0.01,
-                        help="[cosine] 最終LR = 初期LR * final_lr_fraction")
-    parser.add_argument("--t_max_epochs", type=float, default=10.0,
-                        help="[cosine_restarts] 最初のサイクル長（エポック数）")
-    parser.add_argument("--t_mul", type=float, default=2.0,
-                        help="[cosine_restarts] サイクル長の倍率（>1で周期が伸びる）")
-    parser.add_argument("--m_mul", type=float, default=1.0,
-                        help="[cosine_restarts] リスタート毎の初期LR倍率（<1で段階的に下げる）")
-    parser.add_argument("--min_lr_fraction", type=float, default=0.01,
-                        help="[cosine_restarts] 各サイクルの最終LR = サイクル初期LR * min_lr_fraction")
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="cosine",
+        choices=["cosine", "cosine_restarts"],
+        help="Learning rate schedule type",
+    )
+    parser.add_argument(
+        "--final_lr_fraction",
+        type=float,
+        default=0.01,
+        help="[cosine] 最終LR = 初期LR * final_lr_fraction",
+    )
+    parser.add_argument(
+        "--t_max_epochs",
+        type=float,
+        default=10.0,
+        help="[cosine_restarts] 最初のサイクル長（エポック数）",
+    )
+    parser.add_argument(
+        "--t_mul",
+        type=float,
+        default=2.0,
+        help="[cosine_restarts] サイクル長の倍率（>1で周期が伸びる）",
+    )
+    parser.add_argument(
+        "--m_mul",
+        type=float,
+        default=1.0,
+        help="[cosine_restarts] リスタート毎の初期LR倍率（<1で段階的に下げる）",
+    )
+    parser.add_argument(
+        "--min_lr_fraction",
+        type=float,
+        default=0.01,
+        help="[cosine_restarts] 各サイクルの最終LR = サイクル初期LR * min_lr_fraction",
+    )
     parser.add_argument("--steps-per-epoch", type=int, default=0)  # 0→自動計算
     parser.add_argument("--val-steps", type=int, default=0)
     parser.add_argument("--aug-prob", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
 
     # SageMaker input/output channels
-    parser.add_argument("--train", type=str, default=os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train"))
-    parser.add_argument("--val", type=str, default=os.environ.get("SM_CHANNEL_VAL", "/opt/ml/input/data/val"))
-    parser.add_argument("--model_dir", dest="model_dir", type=str, default="/opt/ml/model",
-                    help="モデル成果物の保存先（SageMaker既定）")
-    parser.add_argument("--model-dir", dest="model_dir", type=str, default="/opt/ml/model",
-                    help="同上（ハイフン表記互換）")
+    parser.add_argument(
+        "--train",
+        type=str,
+        default=os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train"),
+    )
+    parser.add_argument(
+        "--val",
+        type=str,
+        default=os.environ.get("SM_CHANNEL_VAL", "/opt/ml/input/data/val"),
+    )
+    parser.add_argument(
+        "--model_dir",
+        dest="model_dir",
+        type=str,
+        default="/opt/ml/model",
+        help="モデル成果物の保存先（SageMaker既定）",
+    )
+    parser.add_argument(
+        "--model-dir",
+        dest="model_dir",
+        type=str,
+        default="/opt/ml/model",
+        help="同上（ハイフン表記互換）",
+    )
     parser.add_argument("--ssim_loss_weight", type=float, default=0.16)
 
     args, unknown = parser.parse_known_args()  # 未知引数が注入されても落ちない
@@ -779,11 +886,12 @@ def parse_args():
         print(f"[warn] Ignored unknown args: {unknown}")
     print(f"[info] model_dir={args.model_dir}")
 
-    #out_dir = args.model_dir or args.output_dir  # 明示されたら model_dir を優先
-    #out_dir = args.output_dir  # model_dir に勝手なs3 uriが注入されるので無視
-    #os.makedirs(out_dir, exist_ok=True)
+    # out_dir = args.model_dir or args.output_dir  # 明示されたら model_dir を優先
+    # out_dir = args.output_dir  # model_dir に勝手なs3 uriが注入されるので無視
+    # os.makedirs(out_dir, exist_ok=True)
 
     return args
+
 
 def main():
     args = parse_args()
@@ -811,7 +919,7 @@ def main():
         seed=args.seed,
     )
     # 学習用（従来どおり2タプル）
-    #train_ds = make_tf_dataset(train_ds_builder, args.batch_size, return_raw=False)
+    # train_ds = make_tf_dataset(train_ds_builder, args.batch_size, return_raw=False)
     # 欠損部を強調（穴=3.0, 背景=1.0）。白塗りマスクなら mask_fill_value=1.0 に変更。
     train_ds = make_tf_dataset(
         train_ds_builder,
@@ -820,7 +928,7 @@ def main():
         hole_weight=3.0,
         context_weight=1.0,
         mask_fill_value=0.0,
-        mask_thr=1.0/255.0,
+        mask_thr=1.0 / 255.0,
     )
     # masked_mae 用（3タプル）
     train_raw_ds = make_tf_dataset(train_ds_builder, args.batch_size, return_raw=True)
@@ -837,15 +945,18 @@ def main():
     val_ds = make_tf_dataset(
         val_ds_builder,
         batch_size=args.batch_size,
-        return_mask_weight=False, # もし検証でも重みを使いたいなら、context_weight>0 かつ eps 付与を必ず適用
+        return_mask_weight=False,  # もし検証でも重みを使いたいなら、context_weight>0 かつ eps 付与を必ず適用
         hole_weight=3.0,
         context_weight=1.0,
         mask_fill_value=0.0,
-        mask_thr=1.0/255.0,
+        mask_thr=1.0 / 255.0,
     )
 
-
-    val_raw_ds = make_tf_dataset(val_ds_builder, args.batch_size, return_raw=True) if len(val_files) > 0 else None
+    val_raw_ds = (
+        make_tf_dataset(val_ds_builder, args.batch_size, return_raw=True)
+        if len(val_files) > 0
+        else None
+    )
 
     # ステップ数自動計算（大きすぎると永遠に回るので上限を設定）
     """
@@ -854,17 +965,18 @@ def main():
     if val_ds is not None:
         val_steps = args.val_steps or max(1, min(len(val_files) // args.batch_size, 1000))
     """
-    
+
     def available_batches(num_files, batch_size):
         # drop_remainder=False なので端数も1バッチとして数える
         return max(1, (num_files + batch_size - 1) // batch_size)
-    
+
     train_batches = available_batches(len(train_files), args.batch_size)
-    val_batches   = available_batches(len(val_files), args.batch_size) if len(val_files) > 0 else 0
-    
+    val_batches = (
+        available_batches(len(val_files), args.batch_size) if len(val_files) > 0 else 0
+    )
+
     steps_per_epoch = args.steps_per_epoch or min(train_batches, 5000)
     val_steps = (args.val_steps or min(val_batches, 1000)) if val_batches > 0 else None
-
 
     # 学習率スケジューラを生成
     lr_schedule = create_lr_schedule(
@@ -872,27 +984,33 @@ def main():
         steps_per_epoch=steps_per_epoch,
         total_epochs=args.epochs,
         schedule_type=args.lr_schedule,
-        final_lr_fraction=args.final_lr_fraction,   # cosine 用
-        t_max_epochs=args.t_max_epochs,            # restarts 用
-        t_mul=args.t_mul,                          # restarts 用
-        m_mul=args.m_mul,                          # restarts 用
-        min_lr_fraction=args.min_lr_fraction,      # restarts 用
+        final_lr_fraction=args.final_lr_fraction,  # cosine 用
+        t_max_epochs=args.t_max_epochs,  # restarts 用
+        t_mul=args.t_mul,  # restarts 用
+        m_mul=args.m_mul,  # restarts 用
+        min_lr_fraction=args.min_lr_fraction,  # restarts 用
     )
 
     # モデル生成（learning_rate に schedule を渡す）
     model = build_model(
         image_size=image_size,
         backbone_name=args.backbone_name,
-        encoder_weights=args.encoder_weights if args.encoder_weights != "None" else None,
+        encoder_weights=(
+            args.encoder_weights if args.encoder_weights != "None" else None
+        ),
         learning_rate=lr_schedule,
-        ssim_loss_weight=args.ssim_loss_weight
+        ssim_loss_weight=args.ssim_loss_weight,
     )
     ## debug
     train_it = iter(train_ds)
-    xb = next(train_it)[0] if isinstance(next(iter(train_ds)), (list, tuple)) else next(train_it)
+    xb = (
+        next(train_it)[0]
+        if isinstance(next(iter(train_ds)), (list, tuple))
+        else next(train_it)
+    )
     yp0 = model.predict(xb, verbose=0)
     print("pre-train y_pred has NaN?", np.isnan(yp0).any())
-    
+
     # データ1バッチを取り出してモデルに通す
     tmp_ds = make_tf_dataset(train_ds_builder, args.batch_size, return_raw=False)
     x_b, y_b = next(iter(tmp_ds.take(1)))
@@ -914,7 +1032,9 @@ def main():
                     current_lr = tf.keras.backend.get_value(opt._decayed_lr(tf.float32))
                 else:
                     # schedule / callable なら step(=iterations) を渡して評価
-                    if isinstance(lr_obj, tf.keras.optimizers.schedules.LearningRateSchedule) or callable(lr_obj):
+                    if isinstance(
+                        lr_obj, tf.keras.optimizers.schedules.LearningRateSchedule
+                    ) or callable(lr_obj):
                         step = tf.cast(opt.iterations, tf.float32)
                         current_lr = tf.keras.backend.get_value(lr_obj(step))
                     else:
@@ -925,24 +1045,29 @@ def main():
                 current_lr = float(tf.convert_to_tensor(lr_obj).numpy())
 
             print(f"[lr] epoch {epoch+1}: {current_lr:.8e}")
-            
+
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
-            ckpt_path, monitor="val_ssim_metric" if val_ds is not None else "psnr_metric",
-            save_best_only=True, save_weights_only=False, mode="max"
+            ckpt_path,
+            monitor="val_ssim_metric" if val_ds is not None else "psnr_metric",
+            save_best_only=True,
+            save_weights_only=False,
+            mode="max",
         ),
         tf.keras.callbacks.EarlyStopping(
             monitor="val_ssim_metric" if val_ds is not None else "psnr_metric",
-            patience=5, mode="max", restore_best_weights=True
+            patience=5,
+            mode="max",
+            restore_best_weights=True,
         ),
         LrLogger(),
-        tf.keras.callbacks.TerminateOnNaN(), # [debug]
+        tf.keras.callbacks.TerminateOnNaN(),  # [debug]
     ]
     if val_raw_ds is not None:
         callbacks.append(MaskedMAELogger(val_raw_ds, name="val", fill_value=0.0))
-        
+
     # 学習
-    
+
     model.fit(
         train_ds,
         epochs=args.epochs,
@@ -967,19 +1092,28 @@ def main():
     if isinstance(batch, (list, tuple)) and len(batch) == 3:
         x_pp, y, sw = batch
         print("x_pp", x_pp.dtype, x_pp.shape, np.nanmin(x_pp), np.nanmax(x_pp))
-        print("y   ", y.dtype,   y.shape,   np.nanmin(y),   np.nanmax(y))
-        print("sw  ", sw.dtype,  sw.shape,  np.sum(sw), np.min(sw), np.max(sw))
-        print("sw sum/min/max:", float(np.sum(sw)), float(np.min(sw)), float(np.max(sw)))
+        print("y   ", y.dtype, y.shape, np.nanmin(y), np.nanmax(y))
+        print("sw  ", sw.dtype, sw.shape, np.sum(sw), np.min(sw), np.max(sw))
+        print(
+            "sw sum/min/max:", float(np.sum(sw)), float(np.min(sw)), float(np.max(sw))
+        )
     else:
         x_pp, y = batch
         print("x_pp", x_pp.dtype, x_pp.shape, np.nanmin(x_pp), np.nanmax(x_pp))
-        print("y   ", y.dtype,   y.shape,   np.nanmin(y),   np.nanmax(y))
+        print("y   ", y.dtype, y.shape, np.nanmin(y), np.nanmax(y))
         print("val_ds has no sample_weight")
-    
+
     # 2) モデル出力の NaN 有無確認（検証の最初の1バッチ）
     y_pred = model.predict(x_pp, verbose=0)
-    print("y_pred", y_pred.dtype, y_pred.shape, np.isnan(y_pred).any(), np.nanmin(y_pred), np.nanmax(y_pred))
-    
+    print(
+        "y_pred",
+        y_pred.dtype,
+        y_pred.shape,
+        np.isnan(y_pred).any(),
+        np.nanmin(y_pred),
+        np.nanmax(y_pred),
+    )
+
     # 3) Keras 経由で1バッチだけ評価（sample_weightの影響も見る）
     if isinstance(batch, (list, tuple)) and len(batch) == 3:
         res = model.test_on_batch(x_pp, y, sample_weight=sw, return_dict=True)
@@ -987,26 +1121,28 @@ def main():
         res = model.test_on_batch(x_pp, y, return_dict=True)
     print(res)
     ## debug end
-    
+
     if val_raw_ds is not None:
         x_pp_b, y_b, x_raw01_b = next(iter(val_raw_ds))  # 1バッチ取り出し
-        y_pred_b = model.predict(x_pp_b, verbose=0)      # 予測（[0,1]想定）
-        mmae = masked_mae_np(y_b.numpy(), y_pred_b, x_raw01_b.numpy(),
-                             fill_value=0.0, thr=1/255.0)
+        y_pred_b = model.predict(x_pp_b, verbose=0)  # 予測（[0,1]想定）
+        mmae = masked_mae_np(
+            y_b.numpy(), y_pred_b, x_raw01_b.numpy(), fill_value=0.0, thr=1 / 255.0
+        )
         print(f"[eval] masked MAE (val, 1 batch): {mmae:.5f}")
     else:
         # val が無ければ train で代用
         x_pp_b, y_b, x_raw01_b = next(iter(train_raw_ds))
         y_pred_b = model.predict(x_pp_b, verbose=0)
-        mmae = masked_mae_np(y_b.numpy(), y_pred_b, x_raw01_b.numpy(),
-                             fill_value=0.0, thr=1/255.0)
+        mmae = masked_mae_np(
+            y_b.numpy(), y_pred_b, x_raw01_b.numpy(), fill_value=0.0, thr=1 / 255.0
+        )
         print(f"[eval] masked MAE (train, 1 batch): {mmae:.5f}")
 
     # SavedModel と重み保存（SageMaker は /opt/ml/model 配下を成果物として取得）
-    #model.save(os.path.join(out_dir, "saved_model"))
-    
+    # model.save(os.path.join(out_dir, "saved_model"))
+
     # 任意: 最終エポックの h5 も保存
-    #model.save(os.path.join(out_dir, "final.h5"))
+    # model.save(os.path.join(out_dir, "final.h5"))
 
     # ==== Preview generation ====
     try:
@@ -1054,7 +1190,7 @@ def main():
         print(f"[preview] saved to: {preview_dir}")
     except Exception as e:
         print(f"[warn] preview generation skipped due to error: {repr(e)}")
-        
+
 
 if __name__ == "__main__":
     main()

@@ -6,7 +6,9 @@ import argparse
 import random
 import numpy as np
 
-os.environ["SM_FRAMEWORK"] = "tf.keras"  # segmentation_models のバックエンド指定（必須）
+os.environ["SM_FRAMEWORK"] = (
+    "tf.keras"  # segmentation_models のバックエンド指定（必須）
+)
 
 import tensorflow as tf
 from tensorflow import keras
@@ -15,6 +17,7 @@ from segmentation_models import Unet
 import albumentations as A
 import cv2
 from freeze import freeze
+
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -30,6 +33,7 @@ def _str2bool(x: str) -> bool:
         return False
     raise argparse.ArgumentTypeError(f"Expected boolean, got: {x}")
 
+
 def weights_arg(s: str):
     if s is None:
         return None
@@ -40,9 +44,11 @@ def weights_arg(s: str):
         return "imagenet"
     raise argparse.ArgumentTypeError(f"Unsupported weights value: {s}")
 
+
 # 追加: 環境変数から data_dir の既定を拾う
 def get_default_data_dir():
     return os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train")
+
 
 # 改良版 list_images（拡張子の大文字小文字を吸収し、デバッグ出力付き）
 def list_images(data_dir, exts=(".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")):
@@ -75,40 +81,57 @@ def list_images(data_dir, exts=(".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"
             print(f"[debug] listing error: {e}")
         raise FileNotFoundError("No images found")
     return sorted(files)
-    
+
 
 def build_albu_transforms(img_size, use_blur=False):
     # 幾何は source/target 共通
-    shared_geom = A.Compose([
-        A.SmallestMaxSize(max_size=img_size, p=1.0),
-        A.CenterCrop(height=img_size, width=img_size, p=1.0),  # リサイズ起因の歪みを避けたい場合
-        # あるいは：A.Resize(img_size, img_size)
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.2),
-        A.RandomRotate90(p=0.5),
-        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.10, rotate_limit=15, border_mode=cv2.BORDER_REFLECT_101, p=0.5),
-    ])
+    shared_geom = A.Compose(
+        [
+            A.SmallestMaxSize(max_size=img_size, p=1.0),
+            A.CenterCrop(
+                height=img_size, width=img_size, p=1.0
+            ),  # リサイズ起因の歪みを避けたい場合
+            # あるいは：A.Resize(img_size, img_size)
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.2),
+            A.RandomRotate90(p=0.5),
+            A.ShiftScaleRotate(
+                shift_limit=0.05,
+                scale_limit=0.10,
+                rotate_limit=15,
+                border_mode=cv2.BORDER_REFLECT_101,
+                p=0.5,
+            ),
+        ]
+    )
 
     # 欠損（CoarseDropout）は ReplayCompose でパラメータを保存
-    coarse_dropout = A.ReplayCompose([
-        A.CoarseDropout(
-            max_holes=8,             # 欠損の個数
-            min_holes=2,
-            max_height=int(img_size * 0.25),
-            max_width=int(img_size * 0.25),
-            min_height=int(img_size * 0.06),
-            min_width=int(img_size * 0.06),
-            fill_value=0,            # 欠損は 0 埋め（後でマスク生成にも利用）
-            p=1.0,
-        )
-    ], p=1.0)
+    coarse_dropout = A.ReplayCompose(
+        [
+            A.CoarseDropout(
+                max_holes=8,  # 欠損の個数
+                min_holes=2,
+                max_height=int(img_size * 0.25),
+                max_width=int(img_size * 0.25),
+                min_height=int(img_size * 0.06),
+                min_width=int(img_size * 0.06),
+                fill_value=0,  # 欠損は 0 埋め（後でマスク生成にも利用）
+                p=1.0,
+            )
+        ],
+        p=1.0,
+    )
 
     # target のみフォトメトリック劣化
-    photometric = A.Compose([
-        A.RandomBrightnessContrast(brightness_limit=0.08, contrast_limit=0.08, p=0.6),
-        A.GaussNoise(var_limit=(2.0, 10.0), p=0.5),
-        A.MotionBlur(blur_limit=3, p=0.2) if use_blur else A.NoOp(),
-    ])
+    photometric = A.Compose(
+        [
+            A.RandomBrightnessContrast(
+                brightness_limit=0.08, contrast_limit=0.08, p=0.6
+            ),
+            A.GaussNoise(var_limit=(2.0, 10.0), p=0.5),
+            A.MotionBlur(blur_limit=3, p=0.2) if use_blur else A.NoOp(),
+        ]
+    )
 
     return shared_geom, coarse_dropout, photometric
 
@@ -159,7 +182,9 @@ def tf_make_pair(path, img_size, use_blur):
         Tout=[tf.float32, tf.float32, tf.float32],
     )
     # 形状を静的に与える
-    img_size = int(img_size.numpy()) if isinstance(img_size, tf.Tensor) else int(img_size)
+    img_size = (
+        int(img_size.numpy()) if isinstance(img_size, tf.Tensor) else int(img_size)
+    )
     tgt.set_shape([img_size, img_size, 3])
     src.set_shape([img_size, img_size, 3])
     mask.set_shape([img_size, img_size, 1])
@@ -208,7 +233,7 @@ class PSNRMetric(keras.metrics.Metric):
         y_pred = tf.cast(y_pred, tf.float32)
         mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=[1, 2, 3])
         mse = tf.maximum(mse, tf.keras.backend.epsilon())
-        psnr = 10.0 * tf.math.log((self.max_val ** 2) / mse) / tf.math.log(10.0)
+        psnr = 10.0 * tf.math.log((self.max_val**2) / mse) / tf.math.log(10.0)
         if sample_weight is not None:
             psnr *= tf.cast(sample_weight, tf.float32)
         self.sum_psnr.assign_add(tf.reduce_sum(psnr))
@@ -221,6 +246,7 @@ class PSNRMetric(keras.metrics.Metric):
         self.sum_psnr.assign(0.0)
         self.count.assign(0.0)
 
+
 def _split_y_pack(ypack, y_channels=None):
     # ypack: (y_true, mask) または Tensor
     if isinstance(ypack, (tuple, list)):
@@ -228,13 +254,14 @@ def _split_y_pack(ypack, y_channels=None):
     # Tensor の場合はチャネルで分割
     if y_channels is not None:
         y_true = ypack[..., :y_channels]
-        mask = ypack[..., y_channels:y_channels+1]
+        mask = ypack[..., y_channels : y_channels + 1]
     else:
         # 既定: 最後の1chをマスクとみなす
         y_true = ypack[..., :-1]
         mask = ypack[..., -1:]
     return y_true, mask
-    
+
+
 class InpaintModel(keras.Model):
     # 追加: target_channels を指定できるように（既定は自動推定＝最後1chをマスク）
     def __init__(self, unet, hole_weight=5.0, target_channels=None, **kwargs):
@@ -250,21 +277,22 @@ class InpaintModel(keras.Model):
     def metrics(self):
         return [self.loss_tracker, self.mae_metric, self.psnr_metric]
 
+
 def _broadcast_mask(mask, like):
     # mask: [B,H,W,1 or C?], like: [B,H,W,C]
     mask = tf.cast(mask, tf.float32)
     if tf.shape(mask)[-1] == 1 and tf.shape(like)[-1] > 1:
         mask = tf.broadcast_to(mask, tf.shape(like))
     return mask
-    
+
     def _make_input_from_target(y_true, mask, fill_value=0.0):
         # 欠損部を fill_value（既定0）で埋める
-        mask = _broadcast_mask(mask, y_true)     # 1ch→Cchへ拡張
+        mask = _broadcast_mask(mask, y_true)  # 1ch→Cchへ拡張
         inv = 1.0 - mask
         fill = tf.cast(fill_value, tf.float32)
         x = y_true * inv + fill * mask
         return x
-    
+
     def train_step(self, data):
         # data が dict({'tgt': y, 'mask': m}) または (x, (y, m)) のどちらでも動く
         if isinstance(data, dict):
@@ -284,21 +312,23 @@ def _broadcast_mask(mask, like):
                     # ypack が結合Tensor [C_y + 1ch] のとき（最後の1chをmaskとみなす）
                     y_true, mask = ypack[..., :-1], ypack[..., -1:]
             x = _make_input_from_target(y_true, mask, fill_value=0.0)
-    
+
         with tf.GradientTape() as tape:
             y_pred = tf.clip_by_value(self.unet(x, training=True), 0.0, 1.0)
             loss = self.compute_loss(y_true, y_pred, mask)
-    
+
         grads = tape.gradient(loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
-    
+
         self.loss_tracker.update_state(loss)
         self.mae_metric.update_state(y_true, y_pred)
         self.psnr_metric.update_state(y_true, y_pred)
-        return {"loss": self.loss_tracker.result(),
-                "mae": self.mae_metric.result(),
-                "psnr": self.psnr_metric.result()}
-    
+        return {
+            "loss": self.loss_tracker.result(),
+            "mae": self.mae_metric.result(),
+            "psnr": self.psnr_metric.result(),
+        }
+
     def test_step(self, data):
         if isinstance(data, dict):
             y_true = data["tgt"]
@@ -315,16 +345,19 @@ def _broadcast_mask(mask, like):
                 else:
                     y_true, mask = ypack[..., :-1], ypack[..., -1:]
             x = _make_input_from_target(y_true, mask, fill_value=0.0)
-    
+
         y_pred = tf.clip_by_value(self.unet(x, training=False), 0.0, 1.0)
         loss = self.compute_loss(y_true, y_pred, mask)
-    
+
         self.loss_tracker.update_state(loss)
         self.mae_metric.update_state(y_true, y_pred)
         self.psnr_metric.update_state(y_true, y_pred)
-        return {"loss": self.loss_tracker.result(),
-                "mae": self.mae_metric.result(),
-                "psnr": self.psnr_metric.result()}        
+        return {
+            "loss": self.loss_tracker.result(),
+            "mae": self.mae_metric.result(),
+            "psnr": self.psnr_metric.result(),
+        }
+
     def compute_pixel_loss(self, y_true, y_pred):
         return tf.reduce_mean(tf.abs(y_true - y_pred), axis=[1, 2, 3])  # L1
 
@@ -339,7 +372,7 @@ def _broadcast_mask(mask, like):
         valid = valid / valid_area
         return tf.reduce_mean(self.hole_weight * hole + valid)
 
-    
+
 def cosine_annealing_schedule(initial_lr, steps_per_epoch, epochs, alpha=0.0):
     total_steps = steps_per_epoch * epochs
     return keras.optimizers.schedules.CosineDecay(
@@ -351,8 +384,12 @@ def cosine_annealing_schedule(initial_lr, steps_per_epoch, epochs, alpha=0.0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default=get_default_data_dir(),
-                    help="入力画像ディレクトリ（既定: SM_CHANNEL_TRAIN or /opt/ml/input/data/train）")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=get_default_data_dir(),
+        help="入力画像ディレクトリ（既定: SM_CHANNEL_TRAIN or /opt/ml/input/data/train）",
+    )
     parser.add_argument("--output_dir", type=str, default="./ssl2_outputs")
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -370,12 +407,26 @@ def main():
     )
     parser.add_argument("--backbone", type=str, default="efficientnetb1")
     parser.add_argument("--train_stage_count", type=int, default=1)
-    parser.add_argument("--freeze_bn", type=int, default=1, help="BatchNormも凍結するか（1/0）")
-    parser.add_argument("--print_frozen_layers", type=int, default=0, help="凍結対象を表示（1/0）")
-    parser.add_argument("--model_dir", dest="model_dir", type=str, default="/opt/ml/model",
-                    help="モデル成果物の保存先（SageMaker既定）")
-    parser.add_argument("--model-dir", dest="model_dir", type=str, default="/opt/ml/model",
-                    help="同上（ハイフン表記互換）")
+    parser.add_argument(
+        "--freeze_bn", type=int, default=1, help="BatchNormも凍結するか（1/0）"
+    )
+    parser.add_argument(
+        "--print_frozen_layers", type=int, default=0, help="凍結対象を表示（1/0）"
+    )
+    parser.add_argument(
+        "--model_dir",
+        dest="model_dir",
+        type=str,
+        default="/opt/ml/model",
+        help="モデル成果物の保存先（SageMaker既定）",
+    )
+    parser.add_argument(
+        "--model-dir",
+        dest="model_dir",
+        type=str,
+        default="/opt/ml/model",
+        help="同上（ハイフン表記互換）",
+    )
 
     args, unknown = parser.parse_known_args()  # 未知引数が注入されても落ちない
     if unknown:
@@ -384,10 +435,10 @@ def main():
     print(f"[info] model_dir={args.model_dir}")
 
     set_seed(args.seed)
-    #out_dir = args.model_dir or args.output_dir  # 明示されたら model_dir を優先
+    # out_dir = args.model_dir or args.output_dir  # 明示されたら model_dir を優先
     out_dir = args.output_dir  # model_dir に勝手なs3 uriが注入されるので無視
     os.makedirs(out_dir, exist_ok=True)
-    
+
     files = list_images(args.data_dir)
     random.Random(args.seed).shuffle(files)
     n_total = len(files)
@@ -396,11 +447,22 @@ def main():
     train_files = files[n_val:]
     print(f"Found {n_total} images. Train: {len(train_files)}, Val: {len(val_files)}")
 
-    train_ds = build_dataset(train_files, args.img_size, args.batch_size, shuffle=True, use_blur=bool(args.use_blur))
-    val_ds = build_dataset(val_files, args.img_size, args.batch_size, shuffle=False, use_blur=bool(args.use_blur))
+    train_ds = build_dataset(
+        train_files,
+        args.img_size,
+        args.batch_size,
+        shuffle=True,
+        use_blur=bool(args.use_blur),
+    )
+    val_ds = build_dataset(
+        val_files,
+        args.img_size,
+        args.batch_size,
+        shuffle=False,
+        use_blur=bool(args.use_blur),
+    )
 
     base_unet = build_unet(args.img_size, args.backbone, args.weights)
-
 
     # ステージ凍結を適用（backbone='efficientnetb1'）
     freeze(
@@ -416,7 +478,9 @@ def main():
     model = InpaintModel(base_unet, hole_weight=args.hole_weight)
 
     steps_per_epoch = math.ceil(len(train_files) / args.batch_size)
-    lr_schedule = cosine_annealing_schedule(args.initial_lr, steps_per_epoch, args.epochs, alpha=0.0)
+    lr_schedule = cosine_annealing_schedule(
+        args.initial_lr, steps_per_epoch, args.epochs, alpha=0.0
+    )
     optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
     model.compile(optimizer=optimizer)
 
