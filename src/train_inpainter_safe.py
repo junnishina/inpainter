@@ -213,13 +213,13 @@ class InpaintingDataset:
                     fit_output=False,
                     p=0.5,
                 ),
-                A.RandomBrightnessContrast(p=0.2),
+                # A.RandomBrightnessContrast(p=0.2),
                 A.ColorJitter(
                     brightness=0.05,
                     contrast=0.05,
                     saturation=0.05,
                     hue=0.01,
-                    p=0.5,
+                    p=0.8,
                 ),
                 A.Resize(height=self.h, width=self.w, interpolation=cv2.INTER_AREA),
             ]
