@@ -183,46 +183,6 @@ def ssim_multiscale_stable(
     return loss
 
 
-"""
-def safe_ms_ssim(
-    y_true, y_pred,
-    value_range=(0.0, 1.0),   # (lo, hi) 入力の想定スケール
-    clip=True,
-    max_levels=5,
-    filter_size=7,
-    k1=0.02, k2=0.04
-):
-    lo, hi = value_range
-    yt = tf.cast(y_true, tf.float32)
-    yp = tf.cast(y_pred, tf.float32)
-
-    # 必要なら入力スケールでのクリップ
-    if clip:
-        yt = tf.clip_by_value(yt, lo, hi)
-        yp = tf.clip_by_value(yp, lo, hi)
-
-    # SSIM用に [0,1] に正規化
-    scale = tf.maximum(hi - lo, 1e-6)
-    yt01 = (yt - lo) / scale
-    yp01 = (yp - lo) / scale
-    eps_margin = 1e-6
-    yt01 = tf.clip_by_value(yt01, eps_margin, 1.0 - eps_margin)
-    yp01 = tf.clip_by_value(yp01, eps_margin, 1.0 - eps_margin)
-
-    # 入力サイズに応じて levels を調整（省略可、前述のロジックを流用）
-    ms = tf.image.ssim_multiscale(
-        yt01, yp01,
-        max_val=1.0,
-        filter_size=filter_size,
-        filter_sigma=1.5,
-        k1=k1, k2=k2
-    )
-    loss = 1.0 - tf.reduce_mean(ms)
-    tf.debugging.assert_all_finite(loss, "MS-SSIM produced NaN/Inf")
-    return loss
-"""
-
-
 def _infer_msssim_levels_from_static_shape(shape, filter_size=7, max_levels=5):
     # shape: TensorShape([N, H, W, C]) を想定
     h = shape[1]
@@ -297,6 +257,10 @@ def composite_loss(
     ssim_loss_weight=0.16,
     use_ms_ssim=True,
     grad_loss_weight=0.05,
+    ssim_max_levels=5,
+    ssim_filter_size=7,
+    ssim_k1=0.02,
+    ssim_k2=0.04,
 ):
     def _loss(y_true, y_pred):
         yt, yp = _to_float01(y_true, y_pred)
@@ -309,10 +273,10 @@ def composite_loss(
                 yt,
                 yp,
                 value_range=(0.0, 1.0),
-                max_levels=5,  # 必要に応じて 3〜4 に
-                filter_size=11,  # 7,  # 7 を推奨（小パッチ安定）
-                k1=0.02,
-                k2=0.04,
+                max_levels=ssim_max_levels,  # 必要に応じて 3〜4 に
+                filter_size=ssim_filter_size,  # 7,  # 7 を推奨（小パッチ安定）
+                k1=ssim_k1,
+                k2=ssim_k2,
             )
         else:
             ssim = tf.image.ssim(
@@ -502,16 +466,6 @@ class InpaintingDataset:
                 p=1.0,
             )
         self.dropout_aug = RectDropout(**coarse_dropout_params)
-        """
-        # debug
-        self.shared_aug = A.Compose([
-            A.HorizontalFlip(p=0.5),
-            A.Resize(height=self.h, width=self.w, interpolation=cv2.INTER_AREA),
-        ], p=1.0)
-        
-        # debug 欠損を一旦オフ
-        self.dropout_aug = None
-        """
 
         # 入力の前処理（エンコーダに一致）
         self.preprocess_input = sm.get_preprocessing(backbone_name)
@@ -623,6 +577,10 @@ def build_model(
     ssim_loss_weight=0.16,
     use_ms_ssim=True,
     grad_loss_weight=0.05,
+    ssim_max_levels=7,
+    ssim_filter_size=11,
+    ssim_k1=0.02,
+    ssim_k2=0.04,
 ):
     model = sm.Unet(
         backbone_name=backbone_name,
@@ -637,39 +595,20 @@ def build_model(
         clipnorm=1.0,
     )  # または clipvalue=1.0)
 
-    # debug
-    """
-    model.compile(
-        optimizer=optimizer,
-        loss=tf.keras.losses.MeanAbsoluteError(),
-        metrics=[psnr_metric, ssim_metric]  # ここに NaN→0 の置換があるなら一旦外す/別名で生の値に
-    )
-    """
-    # debug2
-    model.compile(
-        optimizer=optimizer,
-        loss=composite_loss(
-            ssim_loss_weight=0.05,
-            use_ms_ssim=True,
-            grad_loss_weight=0.02,
-        ),
-        metrics=[psnr_metric, ssim_metric, psnr_raw],
-        # weighted_metrics はデバッグ中は外すと見通しが良い
-    )
-    """
     model.compile(
         optimizer=optimizer,
         loss=composite_loss(
             ssim_loss_weight=ssim_loss_weight,
             use_ms_ssim=use_ms_ssim,
             grad_loss_weight=grad_loss_weight,
+            ssim_max_levels=ssim_max_levels,
+            ssim_filter_size=ssim_filter_size,
+            ssim_k1=ssim_k1,
+            ssim_k2=ssim_k2,
         ),
-        metrics=[psnr_metric,
-                 ssim_metric,
-                 psnr_raw], # 一時的に追加
-        weighted_metrics=[psnr_metric, ssim_metric],
+        metrics=[psnr_metric, ssim_metric, psnr_raw],  # 一時的に追加
+        weighted_metrics=[psnr_metric, ssim_metric],  # デバッグ中は外す
     )
-    """
 
     return model
 
@@ -934,7 +873,14 @@ def parse_args():
     parser.add_argument("--steps-per-epoch", type=int, default=0)  # 0→自動計算
     parser.add_argument("--val-steps", type=int, default=0)
     parser.add_argument("--aug-prob", type=float, default=0.9)
-    parser.add_argument("--hole_weight", type=float, default=3.0)
+    parser.add_argument("--hole_weight", type=float, default=15.0)
+    parser.add_argument("--ssim_loss_weight", type=float, default=0.16)
+    parser.add_argument("--grad_loss_weight", type=float, default=0.05)
+    parser.add_argument("--ssim_max_levels", type=int, default=7)
+    parser.add_argument("--ssim_filter_size", type=int, default=11)
+    parser.add_argument("--ssim_k1", type=float, default=0.02)
+    parser.add_argument("--ssim_k2", type=float, default=0.04)
+
     parser.add_argument("--seed", type=int, default=42)
 
     # SageMaker input/output channels
@@ -962,7 +908,6 @@ def parse_args():
         default="/opt/ml/model",
         help="同上（ハイフン表記互換）",
     )
-    parser.add_argument("--ssim_loss_weight", type=float, default=0.16)
 
     args, unknown = parser.parse_known_args()  # 未知引数が注入されても落ちない
     if unknown:
@@ -1083,6 +1028,12 @@ def main():
         ),
         learning_rate=lr_schedule,
         ssim_loss_weight=args.ssim_loss_weight,
+        use_ms_ssim=True,
+        grad_loss_weight=args.grad_loss_weight,
+        ssim_max_levels=args.ssim_max_levels,
+        ssim_filter_size=args.ssim_filter_size,
+        ssim_k1=args.ssim_k1,
+        ssim_k2=args.ssim_k2,
     )
     ## debug
     train_it = iter(train_ds)
@@ -1139,7 +1090,7 @@ def main():
         ),
         tf.keras.callbacks.EarlyStopping(
             monitor="val_ssim_metric" if val_ds is not None else "psnr_metric",
-            patience=8,
+            patience=12,
             mode="max",
             restore_best_weights=True,
         ),
