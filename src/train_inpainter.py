@@ -32,6 +32,86 @@ except Exception:
 mixed_precision.set_global_policy("float32")  # 既に 'mixed_float16' なら変更
 
 
+def weighted_ssim_metric(y_true4, y_pred3, max_val=1.0, filter_size=7):
+    """
+    y_true4: (..., 4) 先頭3ch=GT、4ch目=mask(1:hole, 0:context)
+    y_pred3: (..., 3) 予測(0-1)
+    評価対象は「穴のみ」。コンテキストはGTに差し替えてからSSIMを算出。
+    """
+    y_true = y_true4[..., :3]
+    mask = y_true4[..., 3:4]  # 1:hole
+
+    y_pred = tf.clip_by_value(y_pred3, 0.0, 1.0)
+
+    # 穴以外はGTに置換（双方同一化）→ SSIMが穴の違いにほぼ依存
+    y_pred_hole_only = mask * y_pred + (1.0 - mask) * y_true
+
+    # 画像ごとのSSIM（スカラー）
+    ssim = tf.image.ssim(
+        y_true, y_pred_hole_only, max_val=max_val, filter_size=filter_size
+    )
+
+    # マスク面積でサンプル重み付け（穴が大きいサンプルを相対的に重視）
+    hole_area = tf.reduce_mean(mask, axis=[1, 2, 3]) + 1e-6  # 比率
+    ssim_weighted = tf.reduce_sum(ssim * hole_area) / tf.reduce_sum(hole_area)
+    return ssim_weighted
+
+
+# Keras Metric としてラップ
+class WeightedSSIMMetric(tf.keras.metrics.Metric):
+    def __init__(self, name="weighted_ssim_metric", filter_size=7, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.filter_size = int(filter_size)
+        self.sum = self.add_weight(name="sum", initializer="zeros", dtype=tf.float32)
+        self.den = self.add_weight(name="den", initializer="zeros", dtype=tf.float32)
+
+    def update_state(self, y_true3, y_pred3, sample_weight=None):
+        y_true = tf.clip_by_value(tf.cast(y_true3, tf.float32), 0.0, 1.0)
+        y_pred = tf.clip_by_value(tf.cast(y_pred3, tf.float32), 0.0, 1.0)
+
+        mask = None
+        if sample_weight is not None:
+            # sample_weight: (B,H,W) or (B,H,W,1) or (B,H,W,3) を許容
+            sw = tf.cast(sample_weight, tf.float32)
+            if tf.rank(sw) == 3:
+                sw = sw[..., tf.newaxis]
+            if sw.shape[-1] > 1:
+                sw = sw[..., :1]
+            sw_min = tf.reduce_min(sw)
+            sw_max = tf.reduce_max(sw)
+            denom = tf.maximum(sw_max - sw_min, 1e-6)
+            mask = tf.clip_by_value((sw - sw_min) / denom, 0.0, 1.0)  # (B,H,W,1)
+
+        if mask is not None:
+            # 穴以外をGTで置換してSSIMを算出（穴のみの差分に依存）
+            y_pred_hole_only = mask * y_pred + (1.0 - mask) * y_true
+            ssim = tf.image.ssim(
+                y_true, y_pred_hole_only, max_val=1.0, filter_size=self.filter_size
+            )  # (B,)
+            hole_area = tf.reduce_mean(mask, axis=[1, 2, 3]) + 1e-6  # (B,)
+            self.sum.assign_add(tf.reduce_sum(ssim * hole_area))
+            self.den.assign_add(tf.reduce_sum(hole_area))
+        else:
+            # マスクが無い場合は通常SSIM（フォールバック）
+            ssim = tf.image.ssim(
+                y_true, y_pred, max_val=1.0, filter_size=self.filter_size
+            )  # (B,)
+            self.sum.assign_add(tf.reduce_sum(ssim))
+            self.den.assign_add(tf.cast(tf.shape(ssim)[0], tf.float32))
+
+    def result(self):
+        return tf.where(self.den > 0.0, self.sum / self.den, 0.0)
+
+    # Keras 3 の正式API
+    def reset_state(self):
+        self.sum.assign(0.0)
+        self.den.assign(0.0)
+
+    # Keras 2 互換（不要なら削除可）
+    def reset_states(self):
+        self.reset_state()
+
+
 def _to_uint8_rgb(img01: np.ndarray) -> np.ndarray:
     """[0,1]のRGB(float32) → uint8 RGB"""
     img = np.clip(img01 * 255.0, 0.0, 255.0).astype(np.uint8)
@@ -360,11 +440,11 @@ class RectDropout(A.ImageOnlyTransform):
 
     def __init__(
         self,
-        num_holes=4,
+        num_holes=9,
         min_h_ratio=0.05,
-        max_h_ratio=0.20,
+        max_h_ratio=0.25,
         min_w_ratio=0.05,
-        max_w_ratio=0.20,
+        max_w_ratio=0.25,
         fill_value=0,
         always_apply=False,
         p=1.0,
@@ -457,11 +537,11 @@ class InpaintingDataset:
         # 欠損（入力のみに適用）
         if coarse_dropout_params is None:
             coarse_dropout_params = dict(
-                num_holes=4,
+                num_holes=9,
                 min_h_ratio=0.05,
-                max_h_ratio=0.20,
+                max_h_ratio=0.25,
                 min_w_ratio=0.05,
-                max_w_ratio=0.20,
+                max_w_ratio=0.25,
                 fill_value=0,  # ← masked_mae の fill_value と合わせる
                 p=1.0,
             )
@@ -595,6 +675,8 @@ def build_model(
         clipnorm=1.0,
     )  # または clipvalue=1.0)
 
+    metric_weighted_ssim = WeightedSSIMMetric(name="weighted_ssim_metric")
+
     model.compile(
         optimizer=optimizer,
         loss=composite_loss(
@@ -606,8 +688,16 @@ def build_model(
             ssim_k1=ssim_k1,
             ssim_k2=ssim_k2,
         ),
-        metrics=[psnr_metric, ssim_metric, psnr_raw],  # 一時的に追加
-        weighted_metrics=[psnr_metric, ssim_metric],  # デバッグ中は外す
+        metrics=[
+            metric_weighted_ssim,
+            psnr_metric,
+            ssim_metric,
+            psnr_raw,
+        ],  # 一時的に追加
+        weighted_metrics=[
+            psnr_metric,
+            # ssim_metric,
+        ],  # デバッグ中は外す
     )
 
     return model
@@ -973,7 +1063,7 @@ def main():
     val_ds = make_tf_dataset(
         val_ds_builder,
         batch_size=args.batch_size,
-        return_mask_weight=False,  # もし検証でも重みを使いたいなら、context_weight>0 かつ eps 付与を必ず適用
+        return_mask_weight=True,  # Trueで、val_weighted_ssim_metric が「穴のみ」を評価できる。検証でも重みを使いたいなら、context_weight>0 かつ eps 付与を必ず適用
         hole_weight=args.hole_weight,
         context_weight=1.0,
         mask_fill_value=0.0,
@@ -1083,16 +1173,10 @@ def main():
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
             ckpt_path,
-            monitor="val_ssim_metric" if val_ds is not None else "psnr_metric",
+            monitor="val_weighted_ssim_metric" if val_ds is not None else "psnr_metric",
             save_best_only=True,
             save_weights_only=False,
             mode="max",
-        ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_ssim_metric" if val_ds is not None else "psnr_metric",
-            patience=12,
-            mode="max",
-            restore_best_weights=True,
         ),
         LrLogger(),
         tf.keras.callbacks.TerminateOnNaN(),  # [debug]
