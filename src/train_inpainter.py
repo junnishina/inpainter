@@ -15,6 +15,8 @@ from tensorflow.keras import mixed_precision
 import cv2
 import albumentations as A
 import segmentation_models as sm
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.applications.vgg16 import preprocess_input as vgg_preprocess
 
 # 画像データ形式は明示的に NHWC
 K.set_image_data_format("channels_last")
@@ -158,6 +160,9 @@ EPS = 1e-7
 
 def _to_float01(y_true, y_pred):
     # AMP（mixed_precision）でもSSIM計算はfloat32で安定させる
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    # 既に 0–1 のはずなら clip だけでもよい
     yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0.0, 1.0)
     yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0.0, 1.0)
     return yt, yp
@@ -333,6 +338,44 @@ def safe_ms_ssim(
     return loss
 
 
+def perceptual_loss(y_true, y_pred, vgg_model, mask=None):
+    """
+    y_true, y_pred: (B, H, W, 3), [0,1] 想定
+    vgg_model: get_vgg_perceptual_model(...) で作ったモデル
+    mask: (B, H, W, 1) or None
+    """
+    y_true, y_pred = _to_float01(y_true, y_pred)
+
+    # VGG16 は BGR・0-255・特定の平均値引き算を想定しているので、
+    # [0,1] → [0,255] → vgg_preprocess
+    yt = y_true * 255.0
+    yp = y_pred * 255.0
+
+    yt = vgg_preprocess(yt)
+    yp = vgg_preprocess(yp)
+
+    feats_t = vgg_model(yt)
+    feats_p = vgg_model(yp)
+
+    if not isinstance(feats_t, (list, tuple)):
+        feats_t = [feats_t]
+        feats_p = [feats_p]
+
+    loss = 0.0
+    for ft, fp in zip(feats_t, feats_p):
+        if mask is not None:
+            # マスクを特徴マップサイズに合わせる（最近傍でOK）
+            m = tf.image.resize(mask, tf.shape(ft)[1:3], method="nearest")
+            diff = tf.abs(ft - fp)
+            # 穴領域のみで平均
+            loss_layer = tf.reduce_sum(diff * m) / (tf.reduce_sum(m) + 1e-6)
+        else:
+            loss_layer = tf.reduce_mean(tf.abs(ft - fp))
+        loss += loss_layer
+
+    return loss / float(len(feats_t))
+
+
 def composite_loss(
     ssim_loss_weight=0.16,
     use_ms_ssim=True,
@@ -341,6 +384,8 @@ def composite_loss(
     ssim_filter_size=7,
     ssim_k1=0.02,
     ssim_k2=0.04,
+    perceptual_weight=0.0,
+    vgg_model=None,
 ):
     def _loss(y_true, y_pred):
         yt, yp = _to_float01(y_true, y_pred)
@@ -372,6 +417,13 @@ def composite_loss(
         grad_term = gradient_l1_loss(yt, yp) if grad_loss_weight > 0 else 0.0
 
         total = mae + ssim_loss_weight * ssim_term + grad_loss_weight * grad_term
+
+        if (perceptual_weight > 0.0) and (vgg_model is not None):
+            # mask を穴領域だけのバイナリマスクで持っているなら渡す
+            # ない場合は mask=None でも OK（画像全体で perceptual）
+            p_loss = perceptual_loss(yt, yp, vgg_model, mask=None)
+            total = total + perceptual_weight * p_loss
+
         # 最終的に非有限は抑止
         # return tf.where(tf.math.is_finite(total), total, tf.zeros_like(total))
         # [debug] ここで即チェック（fail-fast）
@@ -649,6 +701,27 @@ def create_lr_schedule(
         raise ValueError(f"Unsupported lr_schedule: {schedule_type}")
 
 
+# ==========================================
+# VGG Perceptual Model
+# ==========================================
+def get_vgg_perceptual_model(input_shape):
+    """
+    入力: (H, W, 3) [0,1] を想定
+    出力: 任意の中間層の特徴マップ
+    """
+    vgg = VGG16(include_top=False, weights="imagenet", input_shape=input_shape)
+    vgg.trainable = False
+
+    # 好みで層は調整可（block3/4/5 が定番）
+    outputs = [
+        vgg.get_layer("block3_conv3").output,
+        vgg.get_layer("block4_conv3").output,
+    ]
+    model = tf.keras.Model(inputs=vgg.input, outputs=outputs, name="vgg_perceptual")
+    model.trainable = False
+    return model
+
+
 def build_model(
     image_size=(256, 256),
     backbone_name="resnet34",
@@ -661,13 +734,15 @@ def build_model(
     ssim_filter_size=11,
     ssim_k1=0.02,
     ssim_k2=0.04,
+    perceptual_weight=0.0,
 ):
+    input_shape = (image_size[0], image_size[1], 3)
     model = sm.Unet(
         backbone_name=backbone_name,
         encoder_weights=encoder_weights,
         classes=3,
         activation="sigmoid",
-        input_shape=(image_size[0], image_size[1], 3),
+        input_shape=input_shape,
     )
     optimizer = tf.keras.optimizers.Adam(
         learning_rate=learning_rate,
@@ -676,6 +751,8 @@ def build_model(
     )  # または clipvalue=1.0)
 
     metric_weighted_ssim = WeightedSSIMMetric(name="weighted_ssim_metric")
+
+    vgg_model = get_vgg_perceptual_model(input_shape)
 
     model.compile(
         optimizer=optimizer,
@@ -687,6 +764,8 @@ def build_model(
             ssim_filter_size=ssim_filter_size,
             ssim_k1=ssim_k1,
             ssim_k2=ssim_k2,
+            perceptual_weight=perceptual_weight,
+            vgg_model=vgg_model,
         ),
         metrics=[
             metric_weighted_ssim,
@@ -970,7 +1049,12 @@ def parse_args():
     parser.add_argument("--ssim_filter_size", type=int, default=11)
     parser.add_argument("--ssim_k1", type=float, default=0.02)
     parser.add_argument("--ssim_k2", type=float, default=0.04)
-
+    parser.add_argument(
+        "--perceptual_weight",
+        type=float,
+        default=0.1,
+        help="Weight for perceptual (VGG feature) loss.",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     # SageMaker input/output channels
@@ -1124,6 +1208,7 @@ def main():
         ssim_filter_size=args.ssim_filter_size,
         ssim_k1=args.ssim_k1,
         ssim_k2=args.ssim_k2,
+        perceptual_weight=args.perceptual_weight,
     )
     ## debug
     train_it = iter(train_ds)
@@ -1193,7 +1278,7 @@ def main():
         validation_data=val_ds,
         validation_steps=val_steps,
         callbacks=callbacks,
-        verbose=1,
+        verbose=2,
     )
     """
     # debug
