@@ -572,7 +572,7 @@ class InpaintingDataset:
                     # mode=cv2.BORDER_CONSTANT,  # 黒で埋める
                     # cval=(0, 0, 0),            # 黒（グレースケールなら 0）
                     fit_output=False,
-                    p=0.5,
+                    p=self.aug_prob,
                 ),
                 # A.RandomBrightnessContrast(p=0.2),
                 A.ColorJitter(
@@ -580,10 +580,13 @@ class InpaintingDataset:
                     contrast=0.05,
                     saturation=0.05,
                     hue=0.01,
-                    p=0.8,
+                    p=self.aug_prob,
                 ),
-                A.Resize(height=self.h, width=self.w, interpolation=cv2.INTER_AREA),
-            ]
+                A.Resize(
+                    height=self.h, width=self.w, interpolation=cv2.INTER_AREA
+                ),  # Resizeは常時適用（aug_probの外）
+            ],
+            p=1.0,  # 全体としては常に適用で固定
         )
 
         # 欠損（入力のみに適用）
