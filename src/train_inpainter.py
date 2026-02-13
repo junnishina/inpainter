@@ -15,8 +15,6 @@ from tensorflow.keras import mixed_precision
 import cv2
 import albumentations as A
 import segmentation_models as sm
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.applications.vgg16 import preprocess_input as vgg_preprocess
 
 # 画像データ形式は明示的に NHWC
 K.set_image_data_format("channels_last")
@@ -34,427 +32,18 @@ except Exception:
 mixed_precision.set_global_policy("float32")  # 既に 'mixed_float16' なら変更
 
 
-def weighted_ssim_metric(y_true4, y_pred3, max_val=1.0, filter_size=7):
-    """
-    y_true4: (..., 4) 先頭3ch=GT、4ch目=mask(1:hole, 0:context)
-    y_pred3: (..., 3) 予測(0-1)
-    評価対象は「穴のみ」。コンテキストはGTに差し替えてからSSIMを算出。
-    """
-    y_true = y_true4[..., :3]
-    mask = y_true4[..., 3:4]  # 1:hole
+from training.losses.perceptual import get_vgg_perceptual_model, perceptual_loss
 
-    y_pred = tf.clip_by_value(y_pred3, 0.0, 1.0)
+from training.losses.composite import composite_loss
 
-    # 穴以外はGTに置換（双方同一化）→ SSIMが穴の違いにほぼ依存
-    y_pred_hole_only = mask * y_pred + (1.0 - mask) * y_true
+from training.metrics.metrics import (
+    WeightedSSIMMetric,
+    psnr_metric,
+    ssim_metric,
+    psnr_raw,
+)
 
-    # 画像ごとのSSIM（スカラー）
-    ssim = tf.image.ssim(
-        y_true, y_pred_hole_only, max_val=max_val, filter_size=filter_size
-    )
-
-    # マスク面積でサンプル重み付け（穴が大きいサンプルを相対的に重視）
-    hole_area = tf.reduce_mean(mask, axis=[1, 2, 3]) + 1e-6  # 比率
-    ssim_weighted = tf.reduce_sum(ssim * hole_area) / tf.reduce_sum(hole_area)
-    return ssim_weighted
-
-
-# Keras Metric としてラップ
-class WeightedSSIMMetric(tf.keras.metrics.Metric):
-    def __init__(self, name="weighted_ssim_metric", filter_size=7, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.filter_size = int(filter_size)
-        self.sum = self.add_weight(name="sum", initializer="zeros", dtype=tf.float32)
-        self.den = self.add_weight(name="den", initializer="zeros", dtype=tf.float32)
-
-    def update_state(self, y_true3, y_pred3, sample_weight=None):
-        y_true = tf.clip_by_value(tf.cast(y_true3, tf.float32), 0.0, 1.0)
-        y_pred = tf.clip_by_value(tf.cast(y_pred3, tf.float32), 0.0, 1.0)
-
-        mask = None
-        if sample_weight is not None:
-            # sample_weight: (B,H,W) or (B,H,W,1) or (B,H,W,3) を許容
-            sw = tf.cast(sample_weight, tf.float32)
-            if tf.rank(sw) == 3:
-                sw = sw[..., tf.newaxis]
-            if sw.shape[-1] > 1:
-                sw = sw[..., :1]
-            sw_min = tf.reduce_min(sw)
-            sw_max = tf.reduce_max(sw)
-            denom = tf.maximum(sw_max - sw_min, 1e-6)
-            mask = tf.clip_by_value((sw - sw_min) / denom, 0.0, 1.0)  # (B,H,W,1)
-
-        if mask is not None:
-            # 穴以外をGTで置換してSSIMを算出（穴のみの差分に依存）
-            y_pred_hole_only = mask * y_pred + (1.0 - mask) * y_true
-            ssim = tf.image.ssim(
-                y_true, y_pred_hole_only, max_val=1.0, filter_size=self.filter_size
-            )  # (B,)
-            hole_area = tf.reduce_mean(mask, axis=[1, 2, 3]) + 1e-6  # (B,)
-            self.sum.assign_add(tf.reduce_sum(ssim * hole_area))
-            self.den.assign_add(tf.reduce_sum(hole_area))
-        else:
-            # マスクが無い場合は通常SSIM（フォールバック）
-            ssim = tf.image.ssim(
-                y_true, y_pred, max_val=1.0, filter_size=self.filter_size
-            )  # (B,)
-            self.sum.assign_add(tf.reduce_sum(ssim))
-            self.den.assign_add(tf.cast(tf.shape(ssim)[0], tf.float32))
-
-    def result(self):
-        return tf.where(self.den > 0.0, self.sum / self.den, 0.0)
-
-    # Keras 3 の正式API
-    def reset_state(self):
-        self.sum.assign(0.0)
-        self.den.assign(0.0)
-
-    # Keras 2 互換（不要なら削除可）
-    def reset_states(self):
-        self.reset_state()
-
-
-def _to_uint8_rgb(img01: np.ndarray) -> np.ndarray:
-    """[0,1]のRGB(float32) → uint8 RGB"""
-    img = np.clip(img01 * 255.0, 0.0, 255.0).astype(np.uint8)
-    return img
-
-
-def save_preview_batch(
-    x_raw01_b, y_b, y_pred_b, out_dir: str, prefix: str = "val", max_items: int = 16
-):
-    """
-    x_raw01_b, y_b, y_pred_b: (B,H,W,3), [0,1] の想定
-    [input | pred | target] を横連結して PNG 保存
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    b = min(x_raw01_b.shape[0], max_items)
-    for i in range(b):
-        in_img = _to_uint8_rgb(x_raw01_b[i])
-        pr_img = _to_uint8_rgb(y_pred_b[i])
-        gt_img = _to_uint8_rgb(y_b[i])
-
-        concat = np.concatenate([in_img, pr_img, gt_img], axis=1)  # 横連結（W方向）
-        # OpenCVはBGR期待なので変換して保存
-        cv2.imwrite(
-            os.path.join(out_dir, f"{prefix}_{i:03d}.png"),
-            cv2.cvtColor(concat, cv2.COLOR_RGB2BGR),
-        )
-
-
-def weights_arg(s: str):
-    if s is None:
-        return None
-    s_norm = str(s).strip().lower()
-    if s_norm in ("none", "", "null", "nil"):
-        return None
-    if s_norm == "imagenet":
-        return "imagenet"
-    raise argparse.ArgumentTypeError(f"Unsupported weights value: {s}")
-
-
-# ==== Losses: MAE + (SSIM or MS-SSIM) + Gradient (Sobel) ====
-
-EPS = 1e-7
-
-
-def _to_float01(y_true, y_pred):
-    # AMP（mixed_precision）でもSSIM計算はfloat32で安定させる
-    y_true = tf.cast(y_true, tf.float32)
-    y_pred = tf.cast(y_pred, tf.float32)
-    # 既に 0–1 のはずなら clip だけでもよい
-    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0.0, 1.0)
-    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0.0, 1.0)
-    return yt, yp
-
-
-def ssim_loss(y_true, y_pred):
-    yt, yp = _to_float01(y_true, y_pred)
-    ssim = tf.image.ssim(yt, yp, max_val=1.0)
-    return 1.0 - tf.reduce_mean(ssim)
-
-
-def ms_ssim_loss(y_true, y_pred):
-    yt, yp = _to_float01(y_true, y_pred)
-    msssim = tf.image.ssim_multiscale(yt, yp, max_val=1.0)
-    # まれに極端値でNaNが出る場合があるためnanを0に
-    msssim = tf.where(tf.math.is_finite(msssim), msssim, tf.zeros_like(msssim))
-    return 1.0 - tf.reduce_mean(msssim)
-
-
-def gradient_l1_loss(y_true, y_pred):
-    yt, yp = _to_float01(y_true, y_pred)
-    sobel_true = tf.image.sobel_edges(yt)
-    sobel_pred = tf.image.sobel_edges(yp)
-    grad_true = tf.abs(sobel_true[..., 0]) + tf.abs(sobel_true[..., 1])
-    grad_pred = tf.abs(sobel_pred[..., 0]) + tf.abs(sobel_pred[..., 1])
-    return tf.reduce_mean(tf.abs(grad_true - grad_pred))
-
-
-def _avg_pool_2x(x):
-    return tf.nn.avg_pool2d(x, ksize=2, strides=2, padding="SAME")
-
-
-def ssim_multiscale_stable(
-    y_true,
-    y_pred,
-    value_range=(0.0, 1.0),
-    max_levels=3,
-    filter_size=7,
-    k1=0.05,
-    k2=0.05,
-    weights=None,  # Noneなら標準重みの先頭 levels
-    mask=None,  # [N,H,W,1] 可。与えればマスク加重SSIM
-):
-    lo, hi = value_range
-    yt = tf.cast(y_true, tf.float32)
-    yp = tf.cast(y_pred, tf.float32)
-
-    # [lo,hi] -> [0,1]
-    scale = tf.maximum(hi - lo, 1e-6)
-    yt = (yt - lo) / scale
-    yp = (yp - lo) / scale
-
-    eps = 1e-6
-    yt = tf.clip_by_value(yt, eps, 1.0 - eps)
-    yp = tf.clip_by_value(yp, eps, 1.0 - eps)
-
-    tf.debugging.assert_all_finite(yt, "yt_before_ssim has NaN/Inf")
-    tf.debugging.assert_all_finite(yp, "yp_before_ssim has NaN/Inf")
-
-    std_pf5 = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
-    if weights is None:
-        w = std_pf5[:max_levels]
-        s = sum(w)
-        weights = [wi / s for wi in w]
-    else:
-        # Python list 前提、合計1に正規化
-        s = sum(weights)
-        weights = [wi / s for wi in weights]
-
-    ssim_vals = []
-    m = mask
-    for _ in range(max_levels):
-        if m is not None:
-            # マスク加重 SSIM
-            # tf.image.ssim は全画素で平均するので、局所SSIMを直接重み付けはできない。
-            # 代替として、マスクで画素を選別しつつ mean を調整（近似）。
-            ssim_map = tf.image.ssim(
-                yt, yp, max_val=1.0, filter_size=filter_size, k1=k1, k2=k2
-            )
-            # ssim_map: [N], すでに平均済なので厳密なマスク対応は困難。
-            # → 近似として全体の ssim を使うか、マスクにより y を補間してから計算する方が実用的。
-            ssim_vals.append(ssim_map)
-        else:
-            ssim_map = tf.image.ssim(
-                yt, yp, max_val=1.0, filter_size=filter_size, k1=k1, k2=k2
-            )
-            ssim_vals.append(ssim_map)
-        # 次スケールへ
-        yt = _avg_pool_2x(yt)
-        yp = _avg_pool_2x(yp)
-        if m is not None:
-            m = _avg_pool_2x(m)
-
-    # 重み付き平均（安定のため clamp）
-    ssim_vals = [tf.clip_by_value(v, 0.0, 1.0) for v in ssim_vals]
-    ms = 0.0
-    for wi, vi in zip(weights, ssim_vals):
-        ms = ms + wi * vi
-
-    tf.debugging.assert_all_finite(ms, "ms-ssim-stable returned NaN/Inf")
-    loss = 1.0 - tf.reduce_mean(ms)
-    tf.debugging.assert_all_finite(loss, "MS-SSIM-stable produced NaN/Inf")
-    return loss
-
-
-def _infer_msssim_levels_from_static_shape(shape, filter_size=7, max_levels=5):
-    # shape: TensorShape([N, H, W, C]) を想定
-    h = shape[1]
-    w = shape[2]
-    if (h is None) or (w is None):
-        # 動的形状の場合は保守的に小さめ
-        return min(3, max_levels)
-
-    min_hw = int(min(h, w))
-    # 条件: min_hw >= filter_size * 2^(levels-1)
-    # 最大 levels を探索
-    levels = 1
-    while levels < max_levels and (filter_size * (2**levels)) <= min_hw:
-        levels += 1
-    return max(1, min(levels, max_levels))
-
-
-def safe_ms_ssim(
-    y_true,
-    y_pred,
-    value_range=(0.0, 1.0),  # 出力/教師が [0,1] のとき (0,1)
-    max_levels=5,
-    filter_size=7,
-    k1=0.02,
-    k2=0.04,
-):
-    # 1) スケール合わせ（[0,1]）とクリップ（MS-SSIM は物理スケール前提）
-    lo, hi = value_range
-    yt = tf.cast(y_true, tf.float32)
-    yp = tf.cast(y_pred, tf.float32)
-    scale = tf.maximum(hi - lo, 1e-6)
-    yt = (yt - lo) / scale
-    yp = (yp - lo) / scale
-    eps_margin = 1e-6
-    yt = tf.clip_by_value(yt, eps_margin, 1.0 - eps_margin)
-    yp = tf.clip_by_value(yp, eps_margin, 1.0 - eps_margin)
-
-    # 2) levels は静的形状から推定（動的は 3 にフォールバック）
-    levels = _infer_msssim_levels_from_static_shape(
-        yt.shape, filter_size=filter_size, max_levels=max_levels
-    )
-
-    # 3) power_factors は Python リストで固定長に
-    power_factors = [1.0 / levels] * levels
-
-    def assert_finite(name, t):
-        tf.debugging.assert_all_finite(t, f"{name} has NaN/Inf")
-
-    # safe_ms_ssim 内、ssim_multiscale を呼ぶ直前に:
-    assert_finite("yt_before_ssim", yt)
-    assert_finite("yp_before_ssim", yp)
-
-    # 4) MS-SSIM 計算
-    """
-    ms = tf.image.ssim_multiscale(
-        yt, yp,
-        max_val=1.0,
-        power_factors=power_factors,      # ここは list が必須（len() が呼ばれる）
-        filter_size=filter_size,
-        filter_sigma=1.5,
-        k1=k1, k2=k2
-    )
-    loss = 1.0 - tf.reduce_mean(ms)
-    """
-    ssim = tf.image.ssim(yt, yp, max_val=1.0, filter_size=7, k1=0.02, k2=0.04)
-    loss = 1.0 - tf.reduce_mean(ssim)
-    tf.debugging.assert_all_finite(loss, "MS-SSIM produced NaN/Inf")
-    return loss
-
-
-def perceptual_loss(y_true, y_pred, vgg_model, mask=None):
-    """
-    y_true, y_pred: (B, H, W, 3), [0,1] 想定
-    vgg_model: get_vgg_perceptual_model(...) で作ったモデル
-    mask: (B, H, W, 1) or None
-    """
-    y_true, y_pred = _to_float01(y_true, y_pred)
-
-    # VGG16 は BGR・0-255・特定の平均値引き算を想定しているので、
-    # [0,1] → [0,255] → vgg_preprocess
-    yt = y_true * 255.0
-    yp = y_pred * 255.0
-
-    yt = vgg_preprocess(yt)
-    yp = vgg_preprocess(yp)
-
-    feats_t = vgg_model(yt)
-    feats_p = vgg_model(yp)
-
-    if not isinstance(feats_t, (list, tuple)):
-        feats_t = [feats_t]
-        feats_p = [feats_p]
-
-    loss = 0.0
-    for ft, fp in zip(feats_t, feats_p):
-        if mask is not None:
-            # マスクを特徴マップサイズに合わせる（最近傍でOK）
-            m = tf.image.resize(mask, tf.shape(ft)[1:3], method="nearest")
-            diff = tf.abs(ft - fp)
-            # 穴領域のみで平均
-            loss_layer = tf.reduce_sum(diff * m) / (tf.reduce_sum(m) + 1e-6)
-        else:
-            loss_layer = tf.reduce_mean(tf.abs(ft - fp))
-        loss += loss_layer
-
-    return loss / float(len(feats_t))
-
-
-def composite_loss(
-    ssim_loss_weight=0.16,
-    use_ms_ssim=True,
-    grad_loss_weight=0.05,
-    ssim_max_levels=5,
-    ssim_filter_size=7,
-    ssim_k1=0.02,
-    ssim_k2=0.04,
-    perceptual_weight=0.0,
-    vgg_model=None,
-):
-    def _loss(y_true, y_pred):
-        yt, yp = _to_float01(y_true, y_pred)
-        mae = tf.reduce_mean(tf.abs(yt - yp))
-
-        # ssim_term = ms_ssim_loss(yt, yp) if use_ms_ssim else ssim_loss(yt, yp)
-        if use_ms_ssim:
-            # ssim_term = safe_ms_ssim(
-            ssim_term = ssim_multiscale_stable(
-                yt,
-                yp,
-                value_range=(0.0, 1.0),
-                max_levels=ssim_max_levels,  # 必要に応じて 3〜4 に
-                filter_size=ssim_filter_size,  # 7,  # 7 を推奨（小パッチ安定）
-                k1=ssim_k1,
-                k2=ssim_k2,
-            )
-        else:
-            ssim = tf.image.ssim(
-                tf.clip_by_value(yt, 0.0, 1.0),
-                tf.clip_by_value(yp, 0.0, 1.0),
-                max_val=1.0,
-                filter_size=7,
-                k1=0.02,
-                k2=0.04,
-            )
-            ssim_term = 1.0 - tf.reduce_mean(ssim)
-
-        grad_term = gradient_l1_loss(yt, yp) if grad_loss_weight > 0 else 0.0
-
-        total = mae + ssim_loss_weight * ssim_term + grad_loss_weight * grad_term
-
-        if (perceptual_weight > 0.0) and (vgg_model is not None):
-            # mask を穴領域だけのバイナリマスクで持っているなら渡す
-            # ない場合は mask=None でも OK（画像全体で perceptual）
-            p_loss = perceptual_loss(yt, yp, vgg_model, mask=None)
-            total = total + perceptual_weight * p_loss
-
-        # 最終的に非有限は抑止
-        # return tf.where(tf.math.is_finite(total), total, tf.zeros_like(total))
-        # [debug] ここで即チェック（fail-fast）
-        tf.debugging.assert_all_finite(total, "Loss has NaN/Inf")
-        return total
-
-    return _loss
-
-
-# メトリクス
-def psnr_metric(y_true, y_pred):
-    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0.0, 1.0)
-    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0.0, 1.0)
-    v = tf.image.psnr(yt, yp, max_val=1.0)
-    # v = tf.where(tf.math.is_nan(v), tf.zeros_like(v), v)
-    v = tf.where(tf.math.is_inf(v), tf.fill(tf.shape(v), 99.0), v)
-    return tf.reduce_mean(v)
-
-
-def ssim_metric(y_true, y_pred):
-    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0.0, 1.0)
-    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0.0, 1.0)
-    v = tf.image.ssim(yt, yp, max_val=1.0)
-    # v = tf.where(tf.math.is_finite(v), v, tf.zeros_like(v))
-    return tf.reduce_mean(v)
-
-
-def psnr_raw(y_true, y_pred):
-    yt = tf.clip_by_value(tf.cast(y_true, tf.float32), 0.0, 1.0)
-    yp = tf.clip_by_value(tf.cast(y_pred, tf.float32), 0.0, 1.0)
-    return tf.reduce_mean(tf.image.psnr(yt, yp, max_val=1.0))
+# --- Metrics/Loss utilities moved to image_metrics.py ---
 
 
 def list_image_files(
@@ -557,6 +146,7 @@ class InpaintingDataset:
         self.h, self.w = image_size
         self.shuffle = shuffle
         self.rng = random.Random(seed)
+        self.aug_prob = aug_prob
 
         # 共有の幾何・色調Aug（教師にも適用）
         self.shared_aug = A.Compose(
@@ -707,24 +297,6 @@ def create_lr_schedule(
 # ==========================================
 # VGG Perceptual Model
 # ==========================================
-def get_vgg_perceptual_model(input_shape):
-    """
-    入力: (H, W, 3) [0,1] を想定
-    出力: 任意の中間層の特徴マップ
-    """
-    vgg = VGG16(include_top=False, weights="imagenet", input_shape=input_shape)
-    vgg.trainable = False
-
-    # 好みで層は調整可（block3/4/5 が定番）
-    outputs = [
-        vgg.get_layer("block3_conv3").output,
-        vgg.get_layer("block4_conv3").output,
-    ]
-    model = tf.keras.Model(inputs=vgg.input, outputs=outputs, name="vgg_perceptual")
-    model.trainable = False
-    return model
-
-
 def build_model(
     image_size=(256, 256),
     backbone_name="resnet34",
@@ -987,6 +559,19 @@ class MaskedMAELogger(tf.keras.callbacks.Callback):
             thr=self.thr,
         )
         print(f"[eval] epoch {epoch+1}: masked MAE ({self.name}, 1 batch) = {val:.5f}")
+
+
+
+def weights_arg(v: str):
+    """argparse用: encoder weights を 'imagenet' or None に正規化"""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ("none", "null", "nil", "false", "0", ""):
+        return None
+    if s == "imagenet":
+        return "imagenet"
+    raise argparse.ArgumentTypeError("encoder-weights must be 'imagenet' or 'none'")
 
 
 def parse_args():
